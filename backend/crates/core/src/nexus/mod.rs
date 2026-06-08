@@ -1,3 +1,5 @@
+pub mod safe_fetch;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -423,6 +425,40 @@ pub struct RejectActionRequest {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DueDiligenceAuditRequest {
+    pub target_company_name: String,
+    pub urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DueDiligenceAuditResult {
+    pub audit_id: String,
+    pub target_company_name: String,
+    pub urls_audited: usize,
+    pub generated_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MonitorUrlRequest {
+    pub url: String,
+    pub event_type_to_trigger: String,
+    pub subject_type: String,
+    pub subject_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoredUrl {
+    pub monitor_id: String,
+    pub organization_id: String,
+    pub url: String,
+    pub event_type_to_trigger: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub last_content_hash: Option<String>,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusinessBrainQuestion {
     pub question_id: String,
@@ -553,10 +589,11 @@ pub struct NexusDashboard {
 #[derive(Clone)]
 pub struct NexusService {
     store: Arc<Mutex<Connection>>,
+    semantic_render: Option<crate::Shared<crate::semantic_render::SemanticRenderEngine>>,
 }
 
 impl NexusService {
-    pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, AppError> {
+    pub fn new(data_dir: impl AsRef<Path>, semantic_render: Option<crate::Shared<crate::semantic_render::SemanticRenderEngine>>) -> Result<Self, AppError> {
         std::fs::create_dir_all(data_dir.as_ref()).map_err(|error| {
             AppError::Internal(format!("failed to create Nexus data directory: {error}"))
         })?;
@@ -565,6 +602,7 @@ impl NexusService {
         initialize_store(&connection)?;
         Ok(Self {
             store: Arc::new(Mutex::new(connection)),
+            semantic_render,
         })
     }
 
@@ -1050,6 +1088,26 @@ impl NexusService {
                 });
             }
         }
+        let mut processed_data = redact_json(request.data);
+
+        if let Some(semantic) = &self.semantic_render {
+            if let Some(url) = processed_data.get("website_url").and_then(|v| v.as_str()) {
+                let mut engine = semantic.write();
+                if let Ok(html) = safe_fetch::safe_fetch_html(url) {
+                    if let Ok(report) = engine.render(crate::semantic_render::SemanticRenderRequest {
+                        url: url.into(),
+                        html,
+                        content_type: "text/html".into(),
+                        notarize_to_chain: false,
+                    }) {
+                        if let Some(obj) = processed_data.as_object_mut() {
+                            obj.insert("semantic_enrichment".into(), serde_json::to_value(report).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        }
+
         let event = BusinessEvent {
             event_id: new_id("nexus_event"),
             organization_id: organization_id.into(),
@@ -1057,7 +1115,7 @@ impl NexusService {
             event_type: request.event_type.trim().into(),
             subject_type: request.subject_type.trim().into(),
             subject_id: request.subject_id.trim().into(),
-            data: redact_json(request.data),
+            data: processed_data,
             idempotency_key: request.idempotency_key,
             occurred_at_ms: request.occurred_at_ms.unwrap_or_else(now_ms),
             ingested_at_ms: now_ms(),
@@ -1248,6 +1306,147 @@ impl NexusService {
     ) -> Result<Vec<ProposedAction>, AppError> {
         self.require_role(principal_id, organization_id, NexusRole::Viewer)?;
         list_json(&self.store.lock(), "nexus_actions", organization_id, 500)
+    }
+
+    pub fn start_due_diligence_audit(
+        &self,
+        principal_id: &str,
+        organization_id: &str,
+        request: DueDiligenceAuditRequest,
+    ) -> Result<DueDiligenceAuditResult, AppError> {
+        self.require_role(principal_id, organization_id, NexusRole::Operator)?;
+
+        let mut generated_event_ids = Vec::new();
+        let audit_id = new_id("audit");
+
+        for url in &request.urls {
+            // First, trigger semantic render
+            let mut semantic_data = serde_json::Value::Null;
+            if let Some(semantic) = &self.semantic_render {
+                let mut engine = semantic.write();
+                if let Ok(html) = safe_fetch::safe_fetch_html(url) {
+                    if let Ok(report) = engine.render(crate::semantic_render::SemanticRenderRequest {
+                        url: url.clone(),
+                        html,
+                        content_type: "text/html".into(),
+                        notarize_to_chain: true,
+                    }) {
+                        semantic_data = serde_json::to_value(report).unwrap_or_default();
+                    }
+                }
+            }
+
+            // Fan out into different departmental events for agents to pick up
+            let departments = ["audit.finance", "audit.legal", "audit.hr", "audit.compliance"];
+            for dept in departments {
+                let event = BusinessEvent {
+                    event_id: new_id("nexus_event"),
+                    organization_id: organization_id.into(),
+                    source: "due_diligence_auditor".into(),
+                    event_type: dept.into(),
+                    subject_type: "company".into(),
+                    subject_id: request.target_company_name.clone(),
+                    data: serde_json::json!({
+                        "url": url,
+                        "semantic_enrichment": semantic_data
+                    }),
+                    idempotency_key: Some(format!("{}_{}_{}", audit_id, dept, url)),
+                    occurred_at_ms: now_ms(),
+                    ingested_at_ms: now_ms(),
+                };
+                insert_event(&self.store.lock(), &event)?;
+                generated_event_ids.push(event.event_id.clone());
+
+                // Note: we can either manually trigger the agents here, or let them be triggered
+                // by workflows matching the "audit.*" events. For now, we ingest them to the event stream.
+            }
+        }
+
+        Ok(DueDiligenceAuditResult {
+            audit_id,
+            target_company_name: request.target_company_name,
+            urls_audited: request.urls.len(),
+            generated_event_ids,
+        })
+    }
+
+    pub fn monitor_url(
+        &self,
+        principal_id: &str,
+        organization_id: &str,
+        request: MonitorUrlRequest,
+    ) -> Result<MonitoredUrl, AppError> {
+        self.require_role(principal_id, organization_id, NexusRole::Operator)?;
+        let monitor = MonitoredUrl {
+            monitor_id: new_id("monitor"),
+            organization_id: organization_id.into(),
+            url: request.url,
+            event_type_to_trigger: request.event_type_to_trigger,
+            subject_type: request.subject_type,
+            subject_id: request.subject_id,
+            last_content_hash: None,
+            created_at_ms: now_ms(),
+        };
+        insert_json(
+            &self.store.lock(),
+            "nexus_url_monitors",
+            "monitor_id",
+            &monitor.monitor_id,
+            Some(organization_id),
+            &monitor,
+        )?;
+        Ok(monitor)
+    }
+
+    pub fn check_monitored_urls(&self) -> Result<usize, AppError> {
+        let monitors: Vec<MonitoredUrl> = list_all_json(&self.store.lock(), "nexus_url_monitors")?;
+        let mut triggered_count = 0;
+
+        for mut monitor in monitors {
+            if let Some(semantic) = &self.semantic_render {
+                let mut engine = semantic.write();
+                if let Ok(html) = safe_fetch::safe_fetch_html(&monitor.url) {
+                    if let Ok(report) = engine.render(crate::semantic_render::SemanticRenderRequest {
+                        url: monitor.url.clone(),
+                        html,
+                        content_type: "text/html".into(),
+                        notarize_to_chain: false,
+                    }) {
+                        let new_hash = report.content_hash.clone();
+                        if monitor.last_content_hash.as_deref() != Some(new_hash.as_str()) {
+                            monitor.last_content_hash = Some(new_hash);
+                            insert_json(
+                                &self.store.lock(),
+                                "nexus_url_monitors",
+                                "monitor_id",
+                                &monitor.monitor_id,
+                                Some(&monitor.organization_id),
+                                &monitor,
+                            )?;
+
+                            let event = BusinessEvent {
+                                event_id: new_id("nexus_event"),
+                                organization_id: monitor.organization_id.clone(),
+                                source: "url_monitor".into(),
+                                event_type: monitor.event_type_to_trigger.clone(),
+                                subject_type: monitor.subject_type.clone(),
+                                subject_id: monitor.subject_id.clone(),
+                                data: serde_json::json!({
+                                    "url": monitor.url,
+                                    "semantic_enrichment": report
+                                }),
+                                idempotency_key: Some(format!("{}_{}", monitor.monitor_id, report.content_hash)),
+                                occurred_at_ms: now_ms(),
+                                ingested_at_ms: now_ms(),
+                            };
+                            insert_event(&self.store.lock(), &event)?;
+                            triggered_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(triggered_count)
     }
 
     pub fn start_business_brain_interview(
@@ -1742,6 +1941,10 @@ fn initialize_store(connection: &Connection) -> Result<(), AppError> {
                 organization_id TEXT NOT NULL, period TEXT NOT NULL, actions INTEGER NOT NULL,
                 PRIMARY KEY(organization_id, period)
             );
+            CREATE TABLE IF NOT EXISTS nexus_url_monitors (
+                monitor_id TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+            );
             ",
         )
         .map_err(sql_error)
@@ -1822,6 +2025,22 @@ fn read_json<T: for<'de> Deserialize<'de>>(
         )
         .map_err(|_| AppError::NotFound(format!("Nexus record {id}")))?;
     decode(&payload)
+}
+
+fn list_all_json<T: for<'de> Deserialize<'de>>(
+    connection: &Connection,
+    table: &str,
+) -> Result<Vec<T>, AppError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT payload FROM {table} ORDER BY created_at_ms DESC"
+        ))
+        .map_err(sql_error)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?
+        .map(|row| row.map_err(sql_error).and_then(|payload| decode(&payload)))
+        .collect()
 }
 
 fn list_json<T: for<'de> Deserialize<'de>>(
@@ -4560,7 +4779,7 @@ mod tests {
     use super::*;
 
     fn service(label: &str) -> NexusService {
-        NexusService::new(std::env::temp_dir().join(format!("nexus-test-{label}-{}", now_ms())))
+        NexusService::new(std::env::temp_dir().join(format!("nexus-test-{label}-{}", now_ms())), None)
             .expect("service")
     }
 

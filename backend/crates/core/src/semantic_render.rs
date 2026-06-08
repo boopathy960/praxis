@@ -222,7 +222,7 @@ fn strip_tags(raw: &str) -> String {
         .join(" ")
 }
 
-fn is_private_host(host: &str) -> bool {
+pub fn is_private_host(host: &str) -> bool {
     if matches!(host, "localhost" | "127.0.0.1" | "::1") {
         return true;
     }

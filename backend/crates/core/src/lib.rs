@@ -69,7 +69,7 @@ impl AppState {
             astra_brain::CognitiveCoreEngine::new(astra_brain::CognitiveConfig::default()),
         ));
         let asc2 = Asc2Service::new(config.data_path("asc2"), brain.clone())?;
-        let nexus = NexusService::new(config.data_path("nexus"))?;
+        let nexus = NexusService::new(config.data_path("nexus"), Some(semantic_render.clone()))?;
 
         Ok(Self {
             config,
