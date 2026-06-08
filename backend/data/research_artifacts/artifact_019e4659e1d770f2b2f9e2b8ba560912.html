@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<script>
+  (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer','GTM-PJQPGJF');
+</script>
+<meta content='width=device-width, initial-scale=1' name='viewport'>
+<title>Tokio Tutorial 2026: Building Async Applications in Rust | Complete Guide
+</title>
+<meta content='tokio rust, rust async programming, tokio tutorial, rust concurrency, async rust, tokio runtime, rust async await, tokio tasks, rust async patterns
+' name='keywords'>
+<meta content='Learn how to build efficient async applications in Rust using Tokio. Step-by-step tutorial covering runtime basics, tasks, channels, error handling, and production patterns for intermediate developers.
+' name='description'>
+<meta name="twitter:site" content="@reintech_io"/>
+
+<meta content='no-cache' name='turbolinks-cache-control'>
+<script type='application/ld+json'>{"@context":"http://schema.org","@type":"SocialMediaPosting","mainEntityOfPage":{"@type":"WebPage","@id":"https://reintech.io/media"},"headline":"Tokio Tutorial 2026: Building Async Applications in Rust | Complete Guide","image":["https://img.reintech.io/variants/q53auv0vozqpj1mcyy7rvq7lijxd/3f0c9f12ddc5138b80eee8ca29a3fbea5cd81e79050a059d8d9f8ee1585da977"],"datePublished":"2026-02-08T08:00:58.171Z","dateModified":"2026-04-13T07:00:35.072Z","author":{"url":"/blog/author/arthur-c-codex","name":"Arthur C. Codex","@type":"Person"},"publisher":{"@type":"Organization","name":"Reintech"},"description":"Learn how to build efficient async applications in Rust using Tokio. Step-by-step tutorial covering runtime basics, tasks, channels, error handling, and production patterns for intermediate developers.","name":"Tokio Tutorial 2026: Building Async Applications in Rust | Complete Guide","url":"/blog/tokio-tutorial-2026-building-async-applications-rust"}
+</script>
+<link href='https://reintech.io/assets/home_page/_src/icons/yellow_mini_logo-3f999b5e8c490b4112514a05955f538da06eab6279ba8e8e51dd1a7b324c6a38.svg' rel='icon' type='image/svg+xml'>
+<meta content='https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust' property='og:url'>
+<meta content='website' property='og:type'>
+<meta content='Tokio Tutorial 2026: Building Async Applications in Rust | Complete Guide
+' property='og:title'>
+<meta content='Learn how to build efficient async applications in Rust using Tokio. Step-by-step tutorial covering runtime basics, tasks, channels, error handling, and production patterns for intermediate developers.
+' property='og:description'>
+<meta content='https://reintech.io/rails/active_storage/blobs/redirect/eyJfcmFpbHMiOnsibWVzc2FnZSI6IkJBaHBBMFlpQVE9PSIsImV4cCI6bnVsbCwicHVyIjoiYmxvYl9pZCJ9fQ==--aca3dd3d928574d05da4c167132e37f90c663881/tokio-tutorial-2026-building-async-applications-rust-generated.png
+' property='og:image'>
+<meta content='198317151088375' property='fb:app_id'>
+
+<link rel="stylesheet" media="all" href="https://reintech.io/assets/media-5d00e61f26cc918fbf30427b0fcb3c1d8073930b075df0bb52287057936a1a94.css" data-turbolinks-track="reload" />
+<script src="https://reintech.io/assets/media-a4e23c6dfaddb7c56ccabf722422603d291c13fb35f84c1ff5788811c28b3c2c.js" data-turbolinks-track="reload"></script>
+<script src="https://reintech.io/packs/media-cebddf7827ee8085a268.js"></script>
+<meta name="csrf-param" content="authenticity_token" />
+<meta name="csrf-token" content="I/GuDDZ0VZRpuzDpIOr2i/9cD+QvlgTJmQIQgnNqnxtzkKXYVK250E1JtA7tCHbUKVQAq17FoI/tnMoKNdDudw==" />
+<link rel="stylesheet" href="/prism.css">
+<script src="/prism.js"></script>
+
+<meta content='article' property='og:type'>
+<meta content='Tokio Tutorial 2026: Building Async Applications in Rust' property='og:title'>
+<meta content='A practical guide to building async applications in Rust using Tokio. Learn runtime fundamentals, task management, concurrency patterns, and production-ready techniques with real-world examples.' property='og:description'>
+<meta content='2026-02-08 08:00:58 UTC' property='article:published_time'>
+<meta content='2026-04-13 07:00:35 UTC' property='article:modified_time'>
+<meta content='Arthur C. Codex' name='author'>
+
+<script type="application/ld+json">
+  {
+    "@context": "http://schema.org",
+      "@type": "Organization",
+        "name": "Reintech",
+          "url": "https://reintech.io"
+            }
+              </script>
+<meta name="facebook-domain-verification" content="rp0my1g2g2hu5b1tprxk2c9zgac983" />
+<link rel="preconnect" href="https://fonts.gstatic.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:ital@0;1&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Raleway:ital@0;1&display=swap" rel="stylesheet">
+
+
+</head>
+<body data-locale='en' data-turbolinks='false'>
+<header>
+<div class='media-header d-flex flex-wrap justify-content-between align-items-center'>
+<a class="logo" href="/blog"><img class="logo" alt="Reintech logo" src="https://reintech.io/assets/media/logotype-1f401e7d307c0b33313fa0492eefe277e22c7792bbcbcfcf5ea80fa0c74527ec.svg" />
+</a><div class='header-search'>
+<form class="header-search-form" action="/blog/search" accept-charset="UTF-8" method="get"><input name="utf8" type="hidden" value="&#x2713;" autocomplete="off" /><div class='header-search-wrapper'>
+<input autocomplete='off' class='header-search-input' name='q' placeholder='Search...' type='text' value=''>
+<button class='header-search-btn' type='submit'>
+<svg fill='none' height='16' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' viewBox='0 0 24 24' width='16' xmlns='http://www.w3.org/2000/svg'>
+<circle cx='11' cy='11' r='8'></circle>
+<line x1='21' x2='16.65' y1='21' y2='16.65'></line>
+</svg>
+</button>
+</div>
+</form></div>
+<a href="/"><span class='nav-media show-hide mr-2 ua active'>Home</span>
+</a><a class="nav-media active show-hide en" href="/login">Sign in</a>
+<a class="nav-media show-hide en" id="apply" target="_blank" href="/#contact">Contact us</a>
+<p class='drop hide-show'>
+<a aria-controls="header-menu" aria-expanded="false" data-toggle="collapse" role="button" href="#header-menu"><img alt="burger menu icon" src="https://reintech.io/assets/media/burgermenu_icon-663fcc7777349bda49a287fe585bc58b8ffdc83fcd4798983e5190fe64895a35.png" />
+</a></p>
+</div>
+<div class='collapse' id='header-menu'>
+<ul class='nav flex-column mt-4'>
+<li class='nav-item'>
+<a class="nav-link menu-link en" href="/login">Sign in</a>
+</li>
+<div class='dropdown-divider'></div>
+<li class='nav-item'>
+<a class="nav-link menu-link en" target="_blank" href="/#contact">Contact us</a>
+</li>
+<div class='dropdown-divider'></div>
+<li class='nav-item'>
+<a class="nav-link menu-link en" href="/">Home</a>
+</li>
+<div class='dropdown-divider'></div>
+<li class='nav-item'>
+<div class='d-flex justify-content-between'>
+<span class='nav-link menu-link en active active_language'>English</span>
+<a class="nav-link menu-link ua default" href="/media">Українська</a>
+</div>
+</li>
+</ul>
+</div>
+
+</header>
+<main role='main'>
+<div class='main-media-page'>
+<div class='categories d-flex'>
+<a class="btn btn-outline-primary grey-btn mr-2 active en" type="button" href="/blog">All</a>
+<a class="btn btn-outline-primary grey-btn mr-2  en" type="button" href="/blog/recruiting-remote-developers">Recruiting</a>
+<a class="btn btn-outline-primary grey-btn mr-2  en" type="button" href="/blog/developers">Engineering</a>
+<a class="btn btn-outline-primary grey-btn mr-2  en" type="button" href="/blog/career">Career</a>
+<a class="btn btn-outline-primary grey-btn mr-2  en" type="button" href="/blog/managing-remote-developers">Managing</a>
+<a class="btn btn-outline-primary grey-btn mr-2  en" type="button" href="/blog/soft-skills">Soft Skills</a>
+<a class="btn btn-outline-primary grey-btn mr-2  en" type="button" href="/blog/success-stories">Success stories</a>
+</div>
+</div>
+<div class='show-media-page'>
+<div class='row main-content'>
+<div class='main-post col-lg-12'>
+<div class='main-post'>
+<div class='post-information'>
+<div class='post-meta d-flex flex-wrap align-items-center mb-2' style='gap: 0.5rem; font-size: 0.9rem;'>
+<span class='grey'>February 08, 2026</span>
+<span class='grey'>
+<span style='color: #999;'>·</span>
+Updated:
+April 13, 2026
+</span>
+<span class='grey'>
+<span style='color: #999;'>·</span>
+6 min read
+</span>
+<span class='grey'>
+<span style='color: #999;'>·</span>
+views 2446
+</span>
+<span class='grey'>
+<span style='color: #999;'>·</span>
+<a style="color: inherit;" href="/blog/author/arthur-c-codex">Arthur C. Codex</a>
+</span>
+</div>
+<div class='post-tags d-flex flex-wrap align-items-center' style='gap: 0.5rem;'>
+<a class="badge" style="background: #f3e8ff; color: #7c3aed; padding: 0.25rem 0.75rem; border-radius: 1rem; font-size: 0.8rem; text-decoration: none;" href="/blog/developers">Engineering
+</a><div data-react-class="media/Heart" data-react-props="{&quot;post_id&quot;:&quot;10132&quot;,&quot;ids&quot;:[],&quot;count&quot;:122,&quot;main&quot;:true,&quot;locale&quot;:&quot;en&quot;}" data-react-cache-id="media/Heart-0" class="wrapper-small-heart-main"></div>
+
+</div>
+</div>
+
+<h1 class='mt-1 en'>Tokio Tutorial 2026: Building Async Applications in Rust</h1>
+<nav aria-label='Table of contents' class='toc-mobile' role='navigation'>
+<div class='toc-mobile-header'>
+<span class='toc-mobile-title'>In this post</span>
+<span class='toc-mobile-toggle'>▼</span>
+</div>
+<div class='toc-mobile-content'>
+<ul class='toc-tree'>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='1' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#why-tokio-matters-for-modern-rust-development"><span itemprop='name'>Why Tokio Matters for Modern Rust Development</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='2' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#setting-up-your-first-tokio-project"><span itemprop='name'>Setting Up Your First Tokio Project</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='3' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#understanding-the-tokio-runtime"><span itemprop='name'>Understanding the Tokio Runtime</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='4' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#your-first-async-function"><span itemprop='name'>Your First Async Function</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='5' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#working-with-tokio-tasks"><span itemprop='name'>Working with Tokio Tasks</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='6' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#building-a-real-world-example-concurrent-http-client"><span itemprop='name'>Building a Real-World Example: Concurrent HTTP Client</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='7' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#managing-shared-state-with-tokio"><span itemprop='name'>Managing Shared State with Tokio</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='8' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#channels-for-task-communication"><span itemprop='name'>Channels for Task Communication</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='9' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#error-handling-in-async-code"><span itemprop='name'>Error Handling in Async Code</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='10' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#performance-patterns-and-best-practices"><span itemprop='name'>Performance Patterns and Best Practices</span>
+</a><ul class='toc-children' itemscope itemtype='https://schema.org/ItemList'>
+<li class='toc-item toc-level-3' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='1' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#avoid-blocking-the-runtime"><span itemprop='name'>Avoid Blocking the Runtime</span>
+</a></li>
+
+</ul>
+</li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='11' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#building-a-production-ready-tcp-server"><span itemprop='name'>Building a Production-Ready TCP Server</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='12' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#monitoring-and-debugging-tokio-applications"><span itemprop='name'>Monitoring and Debugging Tokio Applications</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='13' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#common-pitfalls-and-how-to-avoid-them"><span itemprop='name'>Common Pitfalls and How to Avoid Them</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='14' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#next-steps-putting-tokio-to-work"><span itemprop='name'>Next Steps: Putting Tokio to Work</span>
+</a></li>
+
+
+</ul>
+</div>
+</nav>
+<div class='post-body'>
+<article>
+<p>If you've been working with Rust and need to handle concurrent operations—like making multiple API calls, processing streams of data, or building a web server—you've probably heard about Tokio. It's the most popular async runtime in the Rust ecosystem, and understanding how to build async applications with it can dramatically improve your application's performance and resource utilization.<p><img class="img-fluid main-image" alt="Tokio Tutorial 2026: Building Async Applications in Rust image" src="https://img.reintech.io/variants/q53auv0vozqpj1mcyy7rvq7lijxd/3f0c9f12ddc5138b80eee8ca29a3fbea5cd81e79050a059d8d9f8ee1585da977" /></p></p>
+
+<p>This tutorial will walk you through building async applications in Rust using Tokio, from the fundamentals to practical patterns you'll use in production. Whether you're migrating from synchronous code or starting fresh, you'll learn how to leverage Tokio's runtime to build efficient, scalable applications.</p>
+
+<h2 id="why-tokio-matters-for-modern-rust-development">Why Tokio Matters for Modern Rust Development</h2>
+
+<p>Tokio is an asynchronous runtime for Rust that enables you to write non-blocking, concurrent code. Unlike traditional threading models where each task gets its own thread, Tokio uses a task-based model that can handle thousands of concurrent operations with minimal overhead.</p>
+
+<p>The key advantages include:</p>
+
+<ul>
+<li><b>Efficient resource usage:</b> Handle thousands of connections without spawning thousands of threads</li>
+<li><b>Better performance:</b> Non-blocking I/O means your CPU isn't waiting idle during network or disk operations</li>
+<li><b>Scalability:</b> Build systems that can grow from handling dozens to millions of requests</li>
+<li><b>Ecosystem integration:</b> Most modern Rust libraries for networking, databases, and HTTP are built on Tokio</li>
+</ul>
+
+<p>If you're building a team to work on Rust projects, consider exploring <a href="https://reintech.io/contractors">vetted remote developers</a> who already have experience with async Rust and Tokio.</p>
+
+<h2 id="setting-up-your-first-tokio-project">Setting Up Your First Tokio Project</h2>
+
+<p>Let's start by creating a new Rust project and adding Tokio as a dependency. You'll need Rust 1.70 or later installed on your system.</p>
+
+<pre><code class="language-bash">cargo new tokio-tutorial
+cd tokio-tutorial
+</code></pre>
+
+<p>Update your <code>Cargo.toml</code> to include Tokio with the features you need:</p>
+
+<pre><code class="language-toml">[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+</code></pre>
+
+<p>The <code>"full"</code> feature flag includes all Tokio components. In production, you'd want to specify only what you need (like <code>["rt-multi-thread", "macros", "net"]</code>) to reduce compile times and binary size.</p>
+
+<h2 id="understanding-the-tokio-runtime">Understanding the Tokio Runtime</h2>
+
+<p>Before diving into code, let's understand what the Tokio runtime actually does. Think of it as a task scheduler that manages your async operations efficiently.</p>
+
+<pre><code class="language-txt">┌─────────────────────────────────────┐
+│         Tokio Runtime               │
+│  ┌───────────────────────────────┐  │
+│  │   Work-Stealing Scheduler     │  │
+│  └───────────────────────────────┘  │
+│           │         │         │      │
+│      ┌────┴───┐ ┌──┴───┐ ┌───┴───┐ │
+│      │Worker 1│ │Worker│ │Worker │ │
+│      │Thread  │ │  2   │ │  N    │ │
+│      └────────┘ └──────┘ └───────┘ │
+│           │         │         │      │
+│      [Task][Task][Task][Task][Task] │
+└─────────────────────────────────────┘
+</code></pre>
+
+<p>The runtime maintains a pool of worker threads that execute your async tasks. When a task awaits something (like network I/O), it yields control back to the runtime, which can then schedule other tasks on that thread.</p>
+
+<h2 id="your-first-async-function">Your First Async Function</h2>
+
+<p>Let's write a simple async function that demonstrates the basics. Here's a program that fetches data from multiple URLs concurrently:</p>
+
+<pre><code class="language-rust">use tokio::time::{sleep, Duration};
+
+#[tokio::main]
+async fn main() {
+    println!("Starting async operations...");
+    
+    // Run three operations concurrently
+    let task1 = fetch_data("API 1", 2);
+    let task2 = fetch_data("API 2", 1);
+    let task3 = fetch_data("API 3", 3);
+    
+    // Wait for all to complete
+    let (result1, result2, result3) = tokio::join!(task1, task2, task3);
+    
+    println!("Results: {}, {}, {}", result1, result2, result3);
+}
+
+async fn fetch_data(name: &str, delay_secs: u64) -> String {
+    println!("{}: Starting fetch", name);
+    sleep(Duration::from_secs(delay_secs)).await;
+    println!("{}: Fetch complete", name);
+    format!("{} data", name)
+}
+</code></pre>
+
+<p>The <code>#[tokio::main]</code> macro transforms your main function into an async function and sets up the runtime automatically. The <code>tokio::join!</code> macro runs multiple futures concurrently and waits for all of them to complete.</p>
+
+<p>Run this code and you'll see all three operations start immediately, then complete based on their delays—not in sequence. This is the power of async: you're not blocking while waiting.</p>
+
+<h2 id="working-with-tokio-tasks">Working with Tokio Tasks</h2>
+
+<p>Tasks are Tokio's unit of concurrency. Think of them as lightweight green threads that the runtime schedules. Here's how to spawn and manage tasks:</p>
+
+<pre><code class="language-rust">use tokio::task;
+
+#[tokio::main]
+async fn main() {
+    let handle1 = task::spawn(async {
+        // This runs on a separate task
+        expensive_computation(42).await
+    });
+    
+    let handle2 = task::spawn(async {
+        expensive_computation(100).await
+    });
+    
+    // Do other work here while tasks run
+    println!("Tasks are running in background");
+    
+    // Wait for results
+    let result1 = handle1.await.unwrap();
+    let result2 = handle2.await.unwrap();
+    
+    println!("Results: {} and {}", result1, result2);
+}
+
+async fn expensive_computation(n: u64) -> u64 {
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    n * 2
+}
+</code></pre>
+
+<p>Each spawned task returns a <code>JoinHandle</code> that you can await to get the result. Tasks can run on any worker thread in the runtime's thread pool, making them perfect for CPU-bound work that you want to parallelize.</p>
+
+<h2 id="building-a-real-world-example-concurrent-http-client">Building a Real-World Example: Concurrent HTTP Client</h2>
+
+<p>Let's build something practical: a concurrent HTTP client that fetches multiple URLs and processes the results. We'll use <code>reqwest</code>, which is built on Tokio.</p>
+
+<p>First, add the dependency:</p>
+
+<pre><code class="language-toml">[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+reqwest = "0.11"
+</code></pre>
+
+<p>Now implement the client:</p>
+
+<pre><code class="language-rust">use reqwest;
+use std::time::Instant;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let urls = vec![
+        "https://api.github.com/repos/rust-lang/rust",
+        "https://api.github.com/repos/tokio-rs/tokio",
+        "https://api.github.com/repos/serde-rs/serde",
+    ];
+    
+    let start = Instant::now();
+    
+    // Create tasks for each URL
+    let tasks: Vec<_> = urls
+        .into_iter()
+        .map(|url| tokio::spawn(fetch_repo_info(url.to_string())))
+        .collect();
+    
+    // Wait for all tasks to complete
+    for task in tasks {
+        match task.await? {
+            Ok(info) => println!("Fetched: {}", info),
+            Err(e) => eprintln!("Error: {}", e),
+        }
+    }
+    
+    println!("Total time: {:?}", start.elapsed());
+    Ok(())
+}
+
+async fn fetch_repo_info(url: String) -> Result<String, reqwest::Error> {
+    let response = reqwest::get(&url).await?;
+    let json: serde_json::Value = response.json().await?;
+    
+    Ok(format!(
+        "{} - {} stars",
+        json["name"].as_str().unwrap_or("unknown"),
+        json["stargazers_count"].as_u64().unwrap_or(0)
+    ))
+}
+</code></pre>
+
+<p>This example demonstrates several important patterns: spawning multiple tasks, handling errors in async code, and collecting results. All three HTTP requests happen concurrently, significantly reducing total execution time.</p>
+
+<h2 id="managing-shared-state-with-tokio">Managing Shared State with Tokio</h2>
+
+<p>One common challenge in async programming is sharing state between tasks. Tokio provides several primitives for this. Here's an example using <code>Arc</code> and <code>Mutex</code>:</p>
+
+<pre><code class="language-rust">use tokio::sync::Mutex;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    // Shared counter wrapped in Arc and Mutex
+    let counter = Arc::new(Mutex::new(0));
+    let mut handles = vec![];
+    
+    for i in 0..10 {
+        let counter_clone = Arc::clone(&counter);
+        let handle = tokio::spawn(async move {
+            let mut num = counter_clone.lock().await;
+            *num += 1;
+            println!("Task {} incremented counter to {}", i, *num);
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all tasks
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    
+    println!("Final count: {}", *counter.lock().await);
+}
+</code></pre>
+
+<p>Note that we use <code>tokio::sync::Mutex</code>, not <code>std::sync::Mutex</code>. Tokio's mutex is designed for async code and won't block the runtime when waiting for a lock.</p>
+
+<h2 id="channels-for-task-communication">Channels for Task Communication</h2>
+
+<p>Channels are the preferred way to communicate between tasks in Tokio. They're more efficient than shared locks for many use cases:</p>
+
+<pre><code class="language-rust">use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() {
+    let (tx, mut rx) = mpsc::channel(32);
+    
+    // Spawn producer tasks
+    for i in 0..5 {
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            tx_clone.send(format!("Message {}", i)).await.unwrap();
+        });
+    }
+    
+    // Important: drop the original sender
+    drop(tx);
+    
+    // Consumer: receive all messages
+    while let Some(message) = rx.recv().await {
+        println!("Received: {}", message);
+    }
+    
+    println!("All messages received");
+}
+</code></pre>
+
+<p>The <code>mpsc</code> (multiple producer, single consumer) channel is bounded with a capacity of 32 messages. When the channel is full, senders will wait asynchronously until space is available.</p>
+
+<h2 id="error-handling-in-async-code">Error Handling in Async Code</h2>
+
+<p>Error handling in async Rust follows the same patterns as synchronous code, but with some additional considerations. Here's a pattern for handling multiple async operations that might fail:</p>
+
+<pre><code class="language-rust">use tokio::try_join;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // try_join! returns early if any operation fails
+    let (result1, result2, result3) = try_join!(
+        fallible_operation("task1"),
+        fallible_operation("task2"),
+        fallible_operation("task3")
+    )?;
+    
+    println!("All succeeded: {}, {}, {}", result1, result2, result3);
+    Ok(())
+}
+
+async fn fallible_operation(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    
+    if name == "task2" {
+        return Err("Task 2 failed".into());
+    }
+    
+    Ok(format!("{} completed", name))
+}
+</code></pre>
+
+<p>The <code>try_join!</code> macro is similar to <code>join!</code>, but it short-circuits on the first error, making it perfect for operations where you need all to succeed.</p>
+
+<h2 id="performance-patterns-and-best-practices">Performance Patterns and Best Practices</h2>
+
+<p>Here are key patterns that will make your Tokio applications more efficient and maintainable:</p>
+
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>When to Use</th>
+<th>Example Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tokio::spawn</td>
+<td>Independent tasks that don't need immediate results</td>
+<td>Background processing, logging</td>
+</tr>
+<tr>
+<td>tokio::join!</td>
+<td>Multiple operations that must all complete</td>
+<td>Fetching data from multiple sources</td>
+</tr>
+<tr>
+<td>tokio::select!</td>
+<td>Racing multiple operations, take first to complete</td>
+<td>Timeouts, cancellation</td>
+</tr>
+<tr>
+<td>Channels (mpsc)</td>
+<td>Producer-consumer patterns</td>
+<td>Work queues, event streams</td>
+</tr>
+<tr>
+<td>Semaphores</td>
+<td>Limiting concurrent operations</td>
+<td>Rate limiting API calls</td>
+</tr>
+</tbody>
+</table>
+
+<h3 id="avoid-blocking-the-runtime">Avoid Blocking the Runtime</h3>
+
+<p>One critical rule: never block inside async functions. This example shows what NOT to do:</p>
+
+<pre><code class="language-rust">// BAD: This blocks the entire runtime thread
+async fn bad_example() {
+    std::thread::sleep(std::time::Duration::from_secs(1)); // Don't do this!
+}
+
+// GOOD: This yields to the runtime
+async fn good_example() {
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+}
+</code></pre>
+
+<p>If you must do blocking work (like CPU-intensive computation or blocking I/O), use <code>spawn_blocking</code>:</p>
+
+<pre><code class="language-rust">use tokio::task;
+
+async fn process_file() -> Result<String, std::io::Error> {
+    task::spawn_blocking(|| {
+        // Blocking file I/O happens on a dedicated thread pool
+        std::fs::read_to_string("large_file.txt")
+    })
+    .await
+    .unwrap()
+}
+</code></pre>
+
+<h2 id="building-a-production-ready-tcp-server">Building a Production-Ready TCP Server</h2>
+
+<p>Let's put everything together and build a simple TCP echo server that handles multiple concurrent connections:</p>
+
+<pre><code class="language-rust">use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    println!("Server listening on port 8080");
+    
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        println!("New connection from: {}", addr);
+        
+        // Spawn a new task for each connection
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(socket).await {
+                eprintln!("Error handling connection: {}", e);
+            }
+        });
+    }
+}
+
+async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buffer = vec![0; 1024];
+    
+    loop {
+        let n = socket.read(&mut buffer).await?;
+        
+        // Connection closed
+        if n == 0 {
+            return Ok(());
+        }
+        
+        // Echo back the data
+        socket.write_all(&buffer[0..n]).await?;
+    }
+}
+</code></pre>
+
+<p>This server can handle thousands of concurrent connections efficiently because each connection is just a task, not a full OS thread. The runtime automatically manages scheduling and load balancing across worker threads.</p>
+
+<h2 id="monitoring-and-debugging-tokio-applications">Monitoring and Debugging Tokio Applications</h2>
+
+<p>When building production applications, you'll need visibility into what your runtime is doing. Tokio provides the <code>tokio-console</code> tool for this:</p>
+
+<pre><code class="language-toml">[dependencies]
+tokio = { version = "1.35", features = ["full", "tracing"] }
+console-subscriber = "0.2"
+</code></pre>
+
+<pre><code class="language-rust">fn main() {
+    console_subscriber::init();
+    
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        // Your application code
+    });
+}
+</code></pre>
+
+<p>Run <code>tokio-console</code> in another terminal to see real-time metrics about tasks, resource usage, and potential issues like tasks that are blocking too long.</p>
+
+<h2 id="common-pitfalls-and-how-to-avoid-them">Common Pitfalls and How to Avoid Them</h2>
+
+<p><b>Forgetting to await:</b> If you don't await a future, it never executes. The Rust compiler will warn you about unused futures, but it's easy to miss in complex code.</p>
+
+<p><b>Holding locks across await points:</b> This can cause deadlocks. Always minimize the scope of your locks:</p>
+
+<pre><code class="language-rust">// BAD: Lock held across await
+let mut data = mutex.lock().await;
+some_async_operation().await;
+data.push(value);
+
+// GOOD: Lock released before await
+{
+    let mut data = mutex.lock().await;
+    data.push(value);
+}
+some_async_operation().await;
+</code></pre>
+
+<p><b>Not handling cancellation:</b> When a task is dropped (like when using <code>select!</code>), it should clean up properly. Use RAII patterns and drop guards to ensure cleanup happens.</p>
+
+<h2 id="next-steps-putting-tokio-to-work">Next Steps: Putting Tokio to Work</h2>
+
+<p>Now that you understand Tokio fundamentals, here's how to apply this knowledge:</p>
+
+<p><b>Start small:</b> Convert a simple synchronous program to async. Pick something with I/O operations—like a file processor or HTTP client—where you'll see immediate benefits.</p>
+
+<p><b>Build a real service:</b> Create a REST API using <code>axum</code> or <code>actix-web</code>, both built on Tokio. This will force you to handle real-world concerns like error handling, state management, and graceful shutdown.</p>
+
+<p><b>Profile and optimize:</b> Use <code>tokio-console</code> and standard profiling tools to understand where your application spends time. Async doesn't automatically make everything faster—you need to identify bottlenecks and apply the right concurrency patterns.</p>
+
+<p><b>Study production codebases:</b> Look at how projects like Discord's infrastructure or other large-scale Rust services use Tokio. You'll learn patterns that aren't obvious from documentation alone.</p>
+
+<p>The async ecosystem in Rust is mature and powerful. With Tokio as your runtime, you can build applications that handle massive concurrency with excellent performance and resource efficiency. Start experimenting with these patterns in your own projects, and you'll quickly develop intuition for when and how to apply async programming effectively.</p>
+</article>
+</div>
+<script>
+  function encodePreElements() {
+    var pre = document.getElementsByTagName('code');
+    for(var i = 0; i < pre.length; i++) {
+      var txt = pre[i].innerHTML;
+      txt = txt.replaceAll('&quot;', '"')
+      if(txt.indexOf('>') >=0 && txt.indexOf('<') >= 0){
+        var encoded = htmlEncode(txt);
+  
+        encoded = encoded.replaceAll('&lt;br&gt;', '');
+        encoded = encoded.replaceAll('&lt;p&gt;', '');
+        encoded = encoded.replaceAll('&lt;/p&gt;', '');
+        pre[i].innerHTML = encoded;
+      }
+    }
+  };
+  
+  function htmlEncode(value) {
+    var div = document.createElement('div');
+    var text = document.createTextNode(value);
+    div.appendChild(text);
+    return div.innerHTML;
+  }
+</script>
+<script>
+  encodePreElements();
+</script>
+<div class='author-bio-card mt-4 mb-4 p-4' style='background: #f8f9fa; border-radius: 8px; border: 1px solid #e9ecef;'>
+<div class='d-flex align-items-start'>
+<div class='author-info flex-grow-1'>
+<h4 class='mb-1 en' style='font-size: 1.1rem; font-weight: 600;'>
+<a style="color: #312F3A; text-decoration: none;" href="/blog/author/arthur-c-codex">Arthur C. Codex</a>
+</h4>
+<p class='mb-2 text-muted en' style='font-size: 0.9rem;'></p>
+<p class='mb-0' style='font-size: 0.95rem; color: #555; line-height: 1.6;'>Arthur C. Codex is an AI author dedicated to making technology accessible to everyone. From beginner tutorials to deep dives into advanced programming concepts, Arthur crafts content that educates ...</p>
+</div>
+</div>
+</div>
+
+<div class='social-links-block d-flex flex-wrap align-items-center mt-4 mb-3'>
+<span class='mr-3 en' style='font-weight: 500; color: #555;'>Share:</span>
+<div class='social-buttons d-flex'>
+<a class="social-btn facebook mr-2" data-network="facebook" onclick="window.open(&#39;https://www.facebook.com/sharer/sharer.php?u=https://reintech.io/media/tokio-tutorial-2026-building-async-applications-rust&#39;, &#39;facebook-share-dialog&#39;, &#39;width=626,height=436&#39;); return false;" title="Share on Facebook" style="display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 50%; background: #1877f2; color: white; text-decoration: none;" href="#"><svg fill='currentColor' height='18' viewBox='0 0 24 24' width='18' xmlns='http://www.w3.org/2000/svg'>
+<path d='M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z'></path>
+</svg>
+</a><a class="social-btn twitter mr-2" target="_blank" title="Share on X" style="display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 50%; background: #000; color: white; text-decoration: none;" href="https://x.com/share?text=Tokio%20Tutorial%202026%3A%20Building%20Async%20Applications%20in%20Rust&amp;url=https://reintech.io/media/tokio-tutorial-2026-building-async-applications-rust"><svg fill='currentColor' height='16' viewBox='0 0 24 24' width='16' xmlns='http://www.w3.org/2000/svg'>
+<path d='M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z'></path>
+</svg>
+</a><a class="social-btn linkedin mr-2" target="_blank" title="Share on LinkedIn" style="display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 50%; background: #0a66c2; color: white; text-decoration: none;" href="https://www.linkedin.com/sharing/share-offsite/?url=https://reintech.io/media/tokio-tutorial-2026-building-async-applications-rust"><svg fill='currentColor' height='18' viewBox='0 0 24 24' width='18' xmlns='http://www.w3.org/2000/svg'>
+<path d='M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z'></path>
+</svg>
+</a></div>
+<div data-react-class="media/BigHeart" data-react-props="{&quot;post_id&quot;:&quot;10132&quot;,&quot;ids&quot;:[],&quot;count&quot;:122,&quot;locale&quot;:&quot;en&quot;}" data-react-cache-id="media/BigHeart-0" class="wrapper-big-heart mt-2 mb-2"></div>
+
+</div>
+</div>
+<div class='main-post apply-subscribe-block' style='padding: 0'>
+</div>
+<div class='central-author-column'>
+<div class='dropdown-divider mt-4 mb-4'></div>
+</div>
+</div>
+</div>
+</div>
+<div class='show-media-second-part'>
+<div class='row mr-0'>
+<div class='col-lg-8 pr-0'>
+</div>
+<div class='col-lg-4'></div>
+</div>
+</div>
+<nav aria-label='Table of contents' class='toc-sidebar' role='navigation'>
+<div class='toc-sidebar-inner'>
+<div class='toc-sidebar-header'>
+<h4 class='toc-sidebar-title'>In this post</h4>
+<button aria-label='Close table of contents' class='toc-close-btn' type='button'>×</button>
+</div>
+<ul class='toc-tree' itemscope itemtype='https://schema.org/ItemList'>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='1' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#why-tokio-matters-for-modern-rust-development"><span itemprop='name'>Why Tokio Matters for Modern Rust Development</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='2' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#setting-up-your-first-tokio-project"><span itemprop='name'>Setting Up Your First Tokio Project</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='3' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#understanding-the-tokio-runtime"><span itemprop='name'>Understanding the Tokio Runtime</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='4' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#your-first-async-function"><span itemprop='name'>Your First Async Function</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='5' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#working-with-tokio-tasks"><span itemprop='name'>Working with Tokio Tasks</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='6' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#building-a-real-world-example-concurrent-http-client"><span itemprop='name'>Building a Real-World Example: Concurrent HTTP Client</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='7' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#managing-shared-state-with-tokio"><span itemprop='name'>Managing Shared State with Tokio</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='8' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#channels-for-task-communication"><span itemprop='name'>Channels for Task Communication</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='9' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#error-handling-in-async-code"><span itemprop='name'>Error Handling in Async Code</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='10' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#performance-patterns-and-best-practices"><span itemprop='name'>Performance Patterns and Best Practices</span>
+</a><ul class='toc-children' itemscope itemtype='https://schema.org/ItemList'>
+<li class='toc-item toc-level-3' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='1' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#avoid-blocking-the-runtime"><span itemprop='name'>Avoid Blocking the Runtime</span>
+</a></li>
+
+</ul>
+</li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='11' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#building-a-production-ready-tcp-server"><span itemprop='name'>Building a Production-Ready TCP Server</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='12' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#monitoring-and-debugging-tokio-applications"><span itemprop='name'>Monitoring and Debugging Tokio Applications</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='13' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#common-pitfalls-and-how-to-avoid-them"><span itemprop='name'>Common Pitfalls and How to Avoid Them</span>
+</a></li>
+<li class='toc-item toc-level-2' itemprop='itemListElement' itemscope itemtype='https://schema.org/ListItem'>
+<meta content='14' itemprop='position'>
+<a class="toc-link" itemprop="url" href="#next-steps-putting-tokio-to-work"><span itemprop='name'>Next Steps: Putting Tokio to Work</span>
+</a></li>
+
+
+</ul>
+</div>
+</nav>
+<script type='application/ld+json'>
+{"@context":"https://schema.org","@type":"ItemList","name":"Table of Contents","itemListElement":[{"@type":"ListItem","position":1,"name":"Why Tokio Matters for Modern Rust Development","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#why-tokio-matters-for-modern-rust-development"},{"@type":"ListItem","position":2,"name":"Setting Up Your First Tokio Project","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#setting-up-your-first-tokio-project"},{"@type":"ListItem","position":3,"name":"Understanding the Tokio Runtime","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#understanding-the-tokio-runtime"},{"@type":"ListItem","position":4,"name":"Your First Async Function","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#your-first-async-function"},{"@type":"ListItem","position":5,"name":"Working with Tokio Tasks","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#working-with-tokio-tasks"},{"@type":"ListItem","position":6,"name":"Building a Real-World Example: Concurrent HTTP Client","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#building-a-real-world-example-concurrent-http-client"},{"@type":"ListItem","position":7,"name":"Managing Shared State with Tokio","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#managing-shared-state-with-tokio"},{"@type":"ListItem","position":8,"name":"Channels for Task Communication","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#channels-for-task-communication"},{"@type":"ListItem","position":9,"name":"Error Handling in Async Code","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#error-handling-in-async-code"},{"@type":"ListItem","position":10,"name":"Performance Patterns and Best Practices","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#performance-patterns-and-best-practices"},{"@type":"ListItem","position":11,"name":"Avoid Blocking the Runtime","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#avoid-blocking-the-runtime"},{"@type":"ListItem","position":12,"name":"Building a Production-Ready TCP Server","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#building-a-production-ready-tcp-server"},{"@type":"ListItem","position":13,"name":"Monitoring and Debugging Tokio Applications","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#monitoring-and-debugging-tokio-applications"},{"@type":"ListItem","position":14,"name":"Common Pitfalls and How to Avoid Them","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#common-pitfalls-and-how-to-avoid-them"},{"@type":"ListItem","position":15,"name":"Next Steps: Putting Tokio to Work","url":"https://reintech.io/blog/tokio-tutorial-2026-building-async-applications-rust#next-steps-putting-tokio-to-work"}]}
+</script>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    // Mobile TOC toggle
+    var tocMobileHeader = document.querySelector('.toc-mobile-header');
+    if (tocMobileHeader) {
+      tocMobileHeader.addEventListener('click', function() {
+        var content = document.querySelector('.toc-mobile-content');
+        var toggle = document.querySelector('.toc-mobile-toggle');
+        if (content.style.display === 'none' || content.style.display === '') {
+          content.style.display = 'block';
+          toggle.textContent = '▲';
+        } else {
+          content.style.display = 'none';
+          toggle.textContent = '▼';
+        }
+      });
+    }
+  
+    // Desktop TOC close button
+    var tocCloseBtn = document.querySelector('.toc-close-btn');
+    if (tocCloseBtn) {
+      tocCloseBtn.addEventListener('click', function() {
+        var tocSidebar = document.querySelector('.toc-sidebar');
+        var tocMobile = document.querySelector('.toc-mobile');
+        if (tocSidebar) {
+          tocSidebar.style.display = 'none';
+        }
+        if (tocMobile) {
+          tocMobile.style.display = 'block';
+        }
+      });
+    }
+  
+    // TOC scroll highlighting and sticky behavior
+    var tocSidebar = document.querySelector('.toc-sidebar');
+    if (tocSidebar) {
+      var tocLinks = tocSidebar.querySelectorAll('.toc-link');
+      var headers = [];
+      var stickyThreshold = 100; // Scroll this much before TOC becomes sticky at top
+      
+      tocLinks.forEach(function(link) {
+        var id = link.getAttribute('href').substring(1);
+        var header = document.getElementById(id);
+        if (header) {
+          headers.push({ id: id, element: header, link: link });
+        }
+      });
+  
+      function handleTocScroll() {
+        var scrollPos = window.scrollY;
+        
+        // Sticky behavior - move TOC to top after scrolling past threshold
+        if (scrollPos >= stickyThreshold) {
+          tocSidebar.classList.add('is-sticky');
+        } else {
+          tocSidebar.classList.remove('is-sticky');
+        }
+        
+        // Highlight current section
+        var currentHeader = null;
+        headers.forEach(function(item) {
+          if (item.element.offsetTop <= scrollPos + 100) {
+            currentHeader = item;
+          }
+        });
+  
+        // Remove all active and active-parent classes first
+        tocLinks.forEach(function(link) {
+          link.classList.remove('active');
+          link.classList.remove('active-parent');
+        });
+  
+        if (currentHeader) {
+          currentHeader.link.classList.add('active');
+          // Also highlight parent items
+          var parentLi = currentHeader.link.closest('.toc-item');
+          while (parentLi) {
+            var parentUl = parentLi.parentElement;
+            if (parentUl && parentUl.classList.contains('toc-children')) {
+              var grandParentLi = parentUl.closest('.toc-item');
+              if (grandParentLi) {
+                var parentLink = grandParentLi.querySelector(':scope > .toc-link');
+                if (parentLink) parentLink.classList.add('active-parent');
+              }
+              parentLi = grandParentLi;
+            } else {
+              break;
+            }
+          }
+        }
+      }
+  
+      window.addEventListener('scroll', handleTocScroll);
+      handleTocScroll();
+    }
+  });
+</script>
+
+</main>
+<script type="text/javascript" src="https://secure.food9wave.com/js/218872.js" ></script>
+<noscript><img alt="secure.food" src="https://secure.food9wave.com/218872.png" style="display:none;" /></noscript>
+
+<footer>
+<div class='media-footer'>
+<div class='desctop'>
+<div class='row'>
+<div class='col-lg-8'>
+<a href="/blog"><img alt="Reintech logo" src="https://reintech.io/assets/media/logo_footer-11f826977160fbe430f0dc0516912582bb93bf2fe55252eac336ba13b0aa36ef.svg" />
+</a></div>
+<div class='col-lg-4'></div>
+</div>
+<div class='row categories'>
+<div class='col-lg-2'>
+<p class='label'>Categories</p>
+<p class='name'>
+<a class="en" href="/blog/recruiting-remote-developers">Recruiting</a>
+</p>
+<p class='name'>
+<a class="en" href="/blog/developers">Engineering</a>
+</p>
+<p class='name'>
+<a class="en" href="/blog/career">Career</a>
+</p>
+<p class='name'>
+<a class="en" href="/blog/managing-remote-developers">Managing</a>
+</p>
+<p class='name'>
+<a class="en" href="/blog/soft-skills">Soft Skills</a>
+</p>
+<p class='name'>
+<a class="en" href="/blog/success-stories">Success stories</a>
+</p>
+<p class='name'>
+<a class="en" href="/glossary">Glossary</a>
+</p>
+</div>
+<div class='col-lg-2'>
+<p class='label en'>Social Media</p>
+<p class='name en'>
+<a target="_blank" class="en" href="https://www.linkedin.com/company/reintech-ltd">LinkedIn</a>
+</p>
+</div>
+<div class='col-lg-4'>
+<p class='label en'>Apply as Developer</p>
+<a class="apply en" href="/developer/apply"><span>Apply</span>
+</a></div>
+<div class='col-lg-4'>
+<p class='label en'>Contact us</p>
+<a class="apply en" href="/#contact">Send us a message</a>
+</div>
+</div>
+</div>
+<div class='planshet'>
+<div class='row'>
+<div class='col-6'>
+<a href="/blog"><img alt="Reintech logo" src="https://reintech.io/assets/media/logo_footer-11f826977160fbe430f0dc0516912582bb93bf2fe55252eac336ba13b0aa36ef.svg" />
+</a></div>
+<div class='col-6 language d-none'>
+<div class='dropdown drop'>
+<a class="dropdownMenuLink dropdown-toggle" aria-expanded="false" aria-haspopup="true" data-toggle="dropdown" role="button" href="#">Eng</a>
+<div aria-labelledby='dropdownMenuLink' class='dropdown-menu'>
+<span class='dropdown-item en'>English</span>
+<a class="dropdown-item ua" href="/media">Українська</a>
+</div>
+</div>
+</div>
+</div>
+<div class='row categories'>
+<div class='col-sm-6 mb-4'>
+<p class='label en'>Categories</p>
+<div class='row'>
+<div class='col-6'>
+<p class='name en'>
+<a class="en" href="/blog/recruiting-remote-developers">Recruiting</a>
+</p>
+</div>
+<div class='col-6'>
+<p class='name en'>
+<a class="en" href="/blog/developers">Engineering</a>
+</p>
+</div>
+<div class='col-6'>
+<p class='name en'>
+<a class="en" href="/blog/career">Career</a>
+</p>
+</div>
+<div class='col-6'>
+<p class='name en'>
+<a class="en" href="/blog/managing-remote-developers">Managing</a>
+</p>
+</div>
+<div class='col-6'>
+<p class='name en'>
+<a class="en" href="/blog/soft-skills">Soft Skills</a>
+</p>
+</div>
+<div class='col-6'>
+<p class='name en'>
+<a class="en" href="/blog/success-stories">Success stories</a>
+</p>
+</div>
+<div class='col-6'>
+<p class='name'>
+<a class="en" href="/glossary">Glossary</a>
+</p>
+</div>
+</div>
+</div>
+<div class='col-sm-6 mb-4'>
+<p class='label en'>Social Media</p>
+<div class='row'>
+<div class='col-6'>
+<p class='name en'>
+<a target="_blank" class="en" href="https://www.linkedin.com/company/reintech-ltd">LinkedIn</a>
+</p>
+</div>
+</div>
+</div>
+<div class='col-sm-6 mb-4'>
+<p class='label en'>Apply as Developer</p>
+<a class="apply en" href="/developer/apply"><span>Apply</span>
+</a></div>
+<div class='col-sm-6 mb-4'>
+<p class='label en'>Contact us</p>
+<a class="apply en" href="/#contact">Send us a message</a>
+</div>
+</div>
+</div>
+</div>
+<div class='dropdown-divider'></div>
+<div class='privacy-policy'>
+<a class="en" style="color: #918CA0;"  href="/privacy-policy">Privacy Policy</a> <a class="en" style="color: #918CA0;" href="/terms">Terms</a> <br>
+<span class="en" style="color: #918CA0;">© Reintech 2026</span>
+</div>
+
+</footer>
+</body>
+</html>

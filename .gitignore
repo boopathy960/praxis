@@ -1,0 +1,25 @@
+# Rust build artifacts
+target/
+backend/target/
+**/target/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.suo
+*.ntvsca
+*.njsproj
+*.sln
+*.sw?
+
+# Environment and sensitive data
+.env
+.env.*
+!.env.example
+*.log
+
+# OS generated files
+Thumbs.db
+db.json
+desktop.ini
+$RECYCLE.BIN/

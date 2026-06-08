@@ -1,0 +1,33 @@
+[workspace]
+members = ["brain", "crates/core", "crates/server", "crates/supervisor"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+actix-cors = "0.7"
+actix-web = "4.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+hex = "0.4"
+log = "0.4"
+ndarray = "0.16"
+parking_lot = "0.12"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand = "0.9"
+regex = "1.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = "0.23"
+rustls-pemfile = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha3 = "0.10"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
+zeroize = "1.8"
