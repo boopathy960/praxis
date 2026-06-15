@@ -13,8 +13,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/httpa/capabilities", web::get().to(capabilities))
         .route("/httpa/sessions", web::post().to(create_session))
         .route("/httpa/intents", web::post().to(submit_intent))
-        .route("/httpa/receipts/{receipt_id}", web::get().to(get_receipt))
-        .route("/httpa/ledger/verify", web::get().to(verify_ledger));
+        .route("/httpa/receipts/{receipt_id}", web::get().to(get_receipt));
 }
 
 async fn capabilities() -> HttpResponse {
@@ -113,7 +112,7 @@ async fn submit_intent(
             status,
             trace_id,
             receipt_id: receipt.receipt_id,
-            receipt_hash: receipt.block_hash,
+            receipt_hash: receipt.payload_hash,
             approval_required: matches!(execution.status, ActivityStatus::ApprovalRequired),
             blocked_reason: execution.blocked_reason,
             orchestration_id: execution.execution_id,
@@ -126,10 +125,6 @@ async fn get_receipt(
     receipt_id: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(ApiResponse::ok(state.httpa.get_receipt(&receipt_id)?)))
-}
-
-async fn verify_ledger(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(ApiResponse::ok(state.httpa.verify_ledger())))
 }
 
 fn authorize_write(state: &web::Data<AppState>, request: &HttpRequest) -> Result<(), AppError> {
@@ -148,7 +143,7 @@ fn authorize_write(state: &web::Data<AppState>, request: &HttpRequest) -> Result
         .and_then(|value| value.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
 
-    if provided == configured {
+    if astra_core::common::constant_time_token_eq(provided, configured) {
         Ok(())
     } else {
         Err(AppError::Unauthorized)

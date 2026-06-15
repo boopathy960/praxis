@@ -39,7 +39,7 @@ async fn create_command(
     })?;
     let response = state
         .assistant_commands
-        .create_command(command, &dlp, &state.brain)?;
+        .create_command(command, &dlp)?;
     let trace_id = new_id("httpa_trace");
     let orchestration =
         state
@@ -120,6 +120,20 @@ async fn create_command(
         orchestration,
         httpa_receipt,
     )?;
+    super::remember(
+        &state,
+        astra_core::chronicle::EpisodeKind::Decision,
+        format!(
+            "assistant command '{}' classified (executable={}, requires_approval={})",
+            response.normalized_text,
+            response.action_plan.executable,
+            response.action_plan.requires_approval,
+        ),
+        "assistant",
+        Some(response.command_id.clone()),
+        vec!["assistant".into()],
+        0.6,
+    );
     Ok(HttpResponse::Accepted().json(ApiResponse::ok(response)))
 }
 
@@ -151,7 +165,7 @@ fn authorize_assistant_write(
         .and_then(|value| value.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
 
-    if provided == configured {
+    if astra_core::common::constant_time_token_eq(provided, configured) {
         Ok(())
     } else {
         Err(AppError::Unauthorized)

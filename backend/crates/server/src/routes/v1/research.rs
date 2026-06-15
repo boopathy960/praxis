@@ -128,6 +128,15 @@ async fn create_job(
             "artifact_safety_reports": artifact_safety_reports,
         }),
     )?;
+    super::remember(
+        &state,
+        astra_core::chronicle::EpisodeKind::Learning,
+        format!("research job completed: {}", job.summary),
+        "research",
+        Some(job.id.clone()),
+        vec!["research".into()],
+        0.6,
+    );
     let mut value = serde_json::to_value(job).map_err(|error| {
         AppError::Internal(format!("research response serialization failed: {error}"))
     })?;

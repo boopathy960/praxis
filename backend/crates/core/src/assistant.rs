@@ -117,11 +117,10 @@ impl AssistantCommandService {
         &self,
         request: AssistantCommandRequest,
         dlp: &DlpAnalysisResponse,
-        brain: &Shared<astra_brain::CognitiveCoreEngine>,
     ) -> Result<AssistantCommandResponse, AppError> {
         let normalized_text = normalize_command_text(&request.text)?;
         let device_id = normalize_device_id(&request.device_id)?;
-        let action_plan = build_action_plan(&normalized_text, request.autonomy_mode, dlp, brain)?;
+        let action_plan = build_action_plan(&normalized_text, request.autonomy_mode, dlp)?;
         let status = command_status_for(&action_plan, dlp);
         let now = now_ms();
         let command_id = new_id("assistant_cmd");
@@ -238,7 +237,6 @@ fn build_action_plan(
     normalized_text: &str,
     autonomy_mode: AssistantAutonomyMode,
     dlp: &DlpAnalysisResponse,
-    brain: &Shared<astra_brain::CognitiveCoreEngine>,
 ) -> Result<AssistantActionPlan, AppError> {
     let lower = normalized_text.to_ascii_lowercase();
     let mut safety_notes = vec![
@@ -290,12 +288,13 @@ fn build_action_plan(
             }),
         )
     } else {
-        let brain_response = brain.write().process_5d(normalized_text);
         (
             AssistantActionKind::RespondText,
             None,
             serde_json::json!({
-                "message": brain_response.response
+                "message": "I can open URLs and allowlisted apps and run web searches. \
+                            For open-ended questions, ask via the Telegram assistant, which \
+                            researches the web and answers with sources."
             }),
         )
     };
@@ -432,9 +431,6 @@ mod tests {
     fn safe_url_command_is_executable_with_receipt() {
         let service = AssistantCommandService::new();
         let dlp = dlp_for_text("open https://example.com");
-        let brain = Shared::new(parking_lot::RwLock::new(
-            astra_brain::CognitiveCoreEngine::new(astra_brain::CognitiveConfig::default()),
-        ));
         let response = service
             .create_command(
                 AssistantCommandRequest {
@@ -445,7 +441,6 @@ mod tests {
                     device_id: "device".into(),
                 },
                 &dlp,
-                &brain,
             )
             .expect("command");
 
@@ -461,9 +456,6 @@ mod tests {
         dlp.verdict.recommended_control = DlpRecommendedControl::PendingOwnerApproval;
         dlp.verdict.approval_required = true;
         dlp.verdict.data_classes = vec![SensitiveDataClass::PrivateKey];
-        let brain = Shared::new(parking_lot::RwLock::new(
-            astra_brain::CognitiveCoreEngine::new(astra_brain::CognitiveConfig::default()),
-        ));
         let response = service
             .create_command(
                 AssistantCommandRequest {
@@ -474,7 +466,6 @@ mod tests {
                     device_id: "device".into(),
                 },
                 &dlp,
-                &brain,
             )
             .expect("command");
 

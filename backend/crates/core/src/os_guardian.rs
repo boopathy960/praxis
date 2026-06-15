@@ -12,7 +12,6 @@ const MAX_METADATA_KEY_BYTES: usize = 80;
 const MAX_METADATA_VALUE_BYTES: usize = 2048;
 const MAX_CONTENT_SAMPLE_BYTES: usize = 4096;
 const MAX_PENDING_DLP_DECISIONS: usize = 128;
-const GENESIS_HASH: &str = "genesis";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,7 +105,6 @@ pub struct GuardianHttpaContext {
     pub session_id: String,
     pub ledger_mode: String,
     pub performance_tier: String,
-    pub chain_receipt_required: bool,
     pub deterministic_replay: bool,
 }
 
@@ -122,9 +120,6 @@ pub struct GuardianAgentAssignment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardianLedgerBlock {
-    pub block_height: u64,
-    pub block_hash: String,
-    pub previous_hash: String,
     pub payload_hash: String,
     pub receipt_id: String,
     pub httpa_trace_id: String,
@@ -135,20 +130,9 @@ pub struct GuardianLedgerBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardianLedgerReceipt {
     pub receipt_id: String,
-    pub block_height: u64,
-    pub block_hash: String,
-    pub previous_hash: String,
     pub payload_hash: String,
     pub httpa_trace_id: String,
     pub agent_role: GuardianAgentRole,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LedgerIntegrityReport {
-    pub valid: bool,
-    pub block_count: usize,
-    pub last_block_hash: Option<String>,
-    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,8 +149,7 @@ pub struct GuardianStatus {
     pub policy: GuardianRuntimePolicy,
     pub buffer_size: usize,
     pub buffer_capacity: usize,
-    pub ledger_height: u64,
-    pub last_block_hash: Option<String>,
+    pub ledger_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,7 +157,6 @@ pub struct GuardianRuntimePolicy {
     pub destructive_actions_enabled: bool,
     pub remediation_requires_approval: bool,
     pub httpa_required: bool,
-    pub chain_receipts_required: bool,
     pub default_ledger_mode: String,
     pub default_performance_tier: String,
     pub metadata_redaction: String,
@@ -374,7 +356,6 @@ impl OsGuardianService {
                 destructive_actions_enabled: false,
                 remediation_requires_approval: true,
                 httpa_required: true,
-                chain_receipts_required: true,
                 default_ledger_mode: "verified_evidence".into(),
                 default_performance_tier: "efficient".into(),
                 metadata_redaction: "secret-like keys and high-entropy values are hashed".into(),
@@ -546,20 +527,7 @@ impl OsGuardianService {
             policy: self.policy.clone(),
             buffer_size: store.events.len(),
             buffer_capacity: self.capacity,
-            ledger_height: store.ledger.len() as u64,
-            last_block_hash: store.ledger.last().map(|block| block.block_hash.clone()),
-        }
-    }
-
-    #[must_use]
-    pub fn verify_ledger(&self) -> LedgerIntegrityReport {
-        verify_blocks(&self.store.read().ledger)
-    }
-
-    #[cfg(test)]
-    fn tamper_latest_block_for_test(&self) {
-        if let Some(block) = self.store.write().ledger.last_mut() {
-            block.payload_hash = "tampered".into();
+            ledger_size: store.ledger.len() as u64,
         }
     }
 }
@@ -784,14 +752,12 @@ fn assign_agent(
             session_id: new_id("httpa_session"),
             ledger_mode: policy.default_ledger_mode.clone(),
             performance_tier: policy.default_performance_tier.clone(),
-            chain_receipt_required: policy.chain_receipts_required,
             deterministic_replay: true,
         },
         quality_requirements: vec![
             "deterministic_evaluation".into(),
             "least_privilege".into(),
             "redacted_metadata_only".into(),
-            "blockchain_receipt_required".into(),
         ],
         assigned_at_ms: now_ms(),
     }
@@ -1211,14 +1177,12 @@ fn assign_dlp_agent(
             session_id: new_id("httpa_session"),
             ledger_mode: policy.default_ledger_mode.clone(),
             performance_tier: policy.default_performance_tier.clone(),
-            chain_receipt_required: policy.chain_receipts_required,
             deterministic_replay: true,
         },
         quality_requirements: vec![
             "personal_owner_context".into(),
             "secret_redaction".into(),
             "no_kernel_side_effects".into(),
-            "blockchain_receipt_required".into(),
         ],
         assigned_at_ms: now_ms(),
     }
@@ -1272,26 +1236,10 @@ fn append_ledger_payload<T: Serialize>(
     let payload_hash = sha3_hex(serde_json::to_string(payload).map_err(|error| {
         AppError::Internal(format!("guardian ledger serialization failed: {error}"))
     })?);
-    let previous_hash = ledger.last().map_or_else(
-        || GENESIS_HASH.to_string(),
-        |block| block.block_hash.clone(),
-    );
-    let block_height = ledger.len() as u64 + 1;
     let receipt_id = new_id("guardian_receipt");
     let timestamp_ms = now_ms();
-    let block_hash = compute_block_hash(
-        block_height,
-        &previous_hash,
-        &payload_hash,
-        &receipt_id,
-        httpa_trace_id,
-        agent_role,
-        timestamp_ms,
-    );
+    // Plain log entry: a content hash of the payload, with no block/chain linkage.
     let block = GuardianLedgerBlock {
-        block_height,
-        block_hash: block_hash.clone(),
-        previous_hash: previous_hash.clone(),
         payload_hash: payload_hash.clone(),
         receipt_id: receipt_id.clone(),
         httpa_trace_id: httpa_trace_id.to_string(),
@@ -1301,76 +1249,10 @@ fn append_ledger_payload<T: Serialize>(
     ledger.push(block);
     Ok(GuardianLedgerReceipt {
         receipt_id,
-        block_height,
-        block_hash,
-        previous_hash,
         payload_hash,
         httpa_trace_id: httpa_trace_id.to_string(),
         agent_role,
     })
-}
-
-fn verify_blocks(blocks: &[GuardianLedgerBlock]) -> LedgerIntegrityReport {
-    let mut errors = Vec::new();
-    let mut previous_hash = GENESIS_HASH.to_string();
-
-    for (index, block) in blocks.iter().enumerate() {
-        let expected_height = index as u64 + 1;
-        if block.block_height != expected_height {
-            errors.push(format!(
-                "block {} has unexpected height {}",
-                index + 1,
-                block.block_height
-            ));
-        }
-        if block.previous_hash != previous_hash {
-            errors.push(format!("block {} previous hash mismatch", index + 1));
-        }
-        let expected_hash = compute_block_hash(
-            block.block_height,
-            &block.previous_hash,
-            &block.payload_hash,
-            &block.receipt_id,
-            &block.httpa_trace_id,
-            block.agent_role,
-            block.timestamp_ms,
-        );
-        if block.block_hash != expected_hash {
-            errors.push(format!("block {} hash mismatch", index + 1));
-        }
-        previous_hash = block.block_hash.clone();
-    }
-
-    LedgerIntegrityReport {
-        valid: errors.is_empty(),
-        block_count: blocks.len(),
-        last_block_hash: blocks.last().map(|block| block.block_hash.clone()),
-        errors,
-    }
-}
-
-fn compute_block_hash(
-    block_height: u64,
-    previous_hash: &str,
-    payload_hash: &str,
-    receipt_id: &str,
-    httpa_trace_id: &str,
-    agent_role: GuardianAgentRole,
-    timestamp_ms: i64,
-) -> String {
-    sha3_hex(
-        serde_json::json!({
-            "block_height": block_height,
-            "previous_hash": previous_hash,
-            "payload_hash": payload_hash,
-            "receipt_id": receipt_id,
-            "httpa_trace_id": httpa_trace_id,
-            "agent_role": agent_role.as_str(),
-            "timestamp_ms": timestamp_ms,
-        })
-        .to_string()
-        .as_bytes(),
-    )
 }
 
 fn contains_any(value: &str, needles: &[&str]) -> bool {
@@ -1841,23 +1723,10 @@ mod tests {
     }
 
     #[test]
-    fn hash_chain_detects_tampering() {
-        let service = OsGuardianService::new();
-        service.submit_event(base_event()).expect("event accepted");
-        assert!(service.verify_ledger().valid);
-
-        service.tamper_latest_block_for_test();
-        let report = service.verify_ledger();
-        assert!(!report.valid);
-        assert!(!report.errors.is_empty());
-    }
-
-    #[test]
-    fn every_event_gets_httpa_assignment_and_chain_receipt() {
+    fn every_event_gets_httpa_assignment_and_receipt() {
         let service = OsGuardianService::new();
         let response = service.submit_event(base_event()).expect("event accepted");
 
-        assert!(response.assignment.httpa.chain_receipt_required);
         assert!(
             response
                 .assignment
@@ -1869,7 +1738,7 @@ mod tests {
             response.receipt.httpa_trace_id,
             response.assignment.httpa.trace_id
         );
-        assert_eq!(service.status().ledger_height, 1);
+        assert_eq!(service.status().ledger_size, 1);
     }
 
     fn base_dlp_signal() -> DataLeakSignal {
@@ -1973,18 +1842,17 @@ mod tests {
     }
 
     #[test]
-    fn dlp_analysis_creates_httpa_assignment_and_chain_receipt() {
+    fn dlp_analysis_creates_httpa_assignment_and_receipt() {
         let service = OsGuardianService::new();
         let response = service
             .analyze_dlp_signal(base_dlp_signal())
             .expect("analysis");
 
-        assert!(response.assignment.httpa.chain_receipt_required);
         assert_eq!(
             response.receipt.httpa_trace_id,
             response.assignment.httpa.trace_id
         );
-        assert!(service.verify_ledger().valid);
+        assert_eq!(service.status().ledger_size, 1);
     }
 
     // ═════════════════════════════════════════════════════════════

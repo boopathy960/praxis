@@ -4,9 +4,15 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::Shared;
-use crate::common::{AppError, new_id, now_ms, random_token, sha3_hex};
+use crate::common::{AppError, constant_time_token_eq, new_id, now_ms, random_token, sha3_hex};
 
 pub const HTTPA_VERSION: &str = "1.0";
+
+/// Hard cap on intents per session; prevents a leaked token from driving
+/// unbounded activity before expiry.
+const MAX_INTENTS_PER_SESSION: u64 = 1_000;
+/// Session lifetime.
+const SESSION_TTL_MS: i64 = 8 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,19 +152,7 @@ pub struct HttpaReceipt {
     pub subject: String,
     pub subject_hash: String,
     pub payload_hash: String,
-    pub block_height: u64,
-    pub block_hash: String,
-    pub previous_hash: String,
-    pub external_anchor: Option<String>,
     pub created_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LedgerIntegrityReport {
-    pub valid: bool,
-    pub block_count: usize,
-    pub last_block_hash: Option<String>,
-    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,7 +171,10 @@ struct HttpaStore {
     sessions: HashMap<String, HttpaSession>,
     devices: HashMap<String, DeviceEnrollment>,
     receipts: HashMap<String, HttpaReceipt>,
-    ledger: Vec<HttpaReceipt>,
+    /// Verified-intent counters per session for quota enforcement.
+    session_use_counts: HashMap<String, u64>,
+    /// Revoked session ids stay listed until they would have expired anyway.
+    revoked_sessions: HashMap<String, i64>,
 }
 
 #[derive(Clone)]
@@ -278,15 +275,18 @@ impl HttpaService {
             session_token: token.clone(),
             session_token_hash: sha3_hex(token.as_bytes()),
             policy,
-            expires_at_ms: now + 8 * 60 * 60 * 1000,
+            expires_at_ms: now + SESSION_TTL_MS,
             created_at_ms: now,
         };
 
         let mut store = self.store.write();
+        purge_expired(&mut store, now);
         store.devices.insert(device_id_hash, enrollment);
-        store
-            .sessions
-            .insert(session.session_id.clone(), session.clone());
+        // The raw token is returned to the caller exactly once; only its hash
+        // is retained at rest.
+        let mut stored = session.clone();
+        stored.session_token = String::new();
+        store.sessions.insert(session.session_id.clone(), stored);
         Ok(session)
     }
 
@@ -295,20 +295,63 @@ impl HttpaService {
         session_id: &str,
         session_token: &str,
     ) -> Result<HttpaSession, AppError> {
-        let session = self
-            .store
-            .read()
+        let now = now_ms();
+        let mut store = self.store.write();
+        if store.revoked_sessions.contains_key(session_id) {
+            return Err(AppError::Unauthorized);
+        }
+        let session = store
             .sessions
             .get(session_id)
             .cloned()
-            .ok_or_else(|| AppError::Unauthorized)?;
-        if session.expires_at_ms < now_ms() {
+            .ok_or(AppError::Unauthorized)?;
+        if session.expires_at_ms < now {
+            store.sessions.remove(session_id);
+            store.session_use_counts.remove(session_id);
             return Err(AppError::Unauthorized);
         }
-        if sha3_hex(session_token.as_bytes()) != session.session_token_hash {
+        if !constant_time_token_eq(
+            &sha3_hex(session_token.as_bytes()),
+            &session.session_token_hash,
+        ) {
             return Err(AppError::Unauthorized);
+        }
+        let uses = store
+            .session_use_counts
+            .entry(session_id.to_string())
+            .or_insert(0);
+        if *uses >= MAX_INTENTS_PER_SESSION {
+            return Err(AppError::Forbidden(
+                "session intent quota exhausted; create a new session".into(),
+            ));
+        }
+        *uses += 1;
+        if let Some(device) = store.devices.get_mut(&session.device_id_hash) {
+            device.last_seen_ms = now;
         }
         Ok(session)
+    }
+
+    /// Immediately invalidates a session. Idempotent.
+    pub fn revoke_session(&self, session_id: &str) -> bool {
+        let mut store = self.store.write();
+        let existed = store.sessions.remove(session_id).is_some();
+        store.session_use_counts.remove(session_id);
+        store
+            .revoked_sessions
+            .insert(session_id.to_string(), now_ms() + SESSION_TTL_MS);
+        existed
+    }
+
+    #[must_use]
+    pub fn active_session_count(&self) -> usize {
+        let now = now_ms();
+        self.store
+            .read()
+            .sessions
+            .values()
+            .filter(|session| session.expires_at_ms >= now)
+            .count()
     }
 
     pub fn device_for_hash(&self, device_id_hash: &str) -> Result<DeviceEnrollment, AppError> {
@@ -331,42 +374,20 @@ impl HttpaService {
         })?;
         let payload_hash = sha3_hex(payload_json.as_bytes());
         let mut store = self.store.write();
-        let previous_hash = store
-            .ledger
-            .last()
-            .map(|receipt| receipt.block_hash.clone())
-            .unwrap_or_else(|| "genesis".into());
-        let block_height = store.ledger.len() as u64 + 1;
         let created_at_ms = now_ms();
         let receipt_id = new_id("httpa_receipt");
         let subject_hash = sha3_hex(subject.as_bytes());
-        let block_hash = sha3_hex(
-            serde_json::json!({
-                "receipt_id": receipt_id,
-                "trace_id": trace_id,
-                "subject_hash": subject_hash,
-                "payload_hash": payload_hash,
-                "block_height": block_height,
-                "previous_hash": previous_hash,
-                "created_at_ms": created_at_ms,
-            })
-            .to_string()
-            .as_bytes(),
-        );
+        // Plain provenance record: a content hash of the payload, with no
+        // block/chain linkage (the tamper-evident ledger was removed).
         let receipt = HttpaReceipt {
             receipt_id: receipt_id.clone(),
             trace_id: trace_id.into(),
             subject: subject.into(),
             subject_hash,
             payload_hash,
-            block_height,
-            block_hash,
-            previous_hash,
-            external_anchor: None,
             created_at_ms,
         };
         store.receipts.insert(receipt_id, receipt.clone());
-        store.ledger.push(receipt.clone());
         Ok(receipt)
     }
 
@@ -378,41 +399,21 @@ impl HttpaService {
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("HTTPA receipt {receipt_id}")))
     }
-
-    #[must_use]
-    pub fn verify_ledger(&self) -> LedgerIntegrityReport {
-        let ledger = &self.store.read().ledger;
-        let mut previous_hash = "genesis".to_string();
-        let mut errors = Vec::new();
-        for (index, receipt) in ledger.iter().enumerate() {
-            let expected_height = index as u64 + 1;
-            if receipt.block_height != expected_height {
-                errors.push(format!(
-                    "receipt {} has unexpected height",
-                    receipt.receipt_id
-                ));
-            }
-            if receipt.previous_hash != previous_hash {
-                errors.push(format!(
-                    "receipt {} previous hash mismatch",
-                    receipt.receipt_id
-                ));
-            }
-            previous_hash = receipt.block_hash.clone();
-        }
-        LedgerIntegrityReport {
-            valid: errors.is_empty(),
-            block_count: ledger.len(),
-            last_block_hash: ledger.last().map(|receipt| receipt.block_hash.clone()),
-            errors,
-        }
-    }
 }
 
 impl Default for HttpaService {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Drops expired sessions and stale revocation tombstones.
+fn purge_expired(store: &mut HttpaStore, now: i64) {
+    store.sessions.retain(|_, session| session.expires_at_ms >= now);
+    store
+        .session_use_counts
+        .retain(|session_id, _| store.sessions.contains_key(session_id));
+    store.revoked_sessions.retain(|_, keep_until| *keep_until >= now);
 }
 
 fn normalize_device_id(device_id: &str) -> Result<String, AppError> {
@@ -494,16 +495,121 @@ mod tests {
     }
 
     #[test]
-    fn receipts_form_local_hash_chain() {
+    fn raw_token_is_not_retained_at_rest() {
         let service = HttpaService::new();
-        let first = service
+        let session = service
+            .create_session(
+                CreateHttpaSessionRequest {
+                    device_id: "owner-desktop".into(),
+                    device_capabilities: Vec::new(),
+                    action_allowlist: Vec::new(),
+                    requested_policy: None,
+                },
+                true,
+            )
+            .expect("session");
+        let stored = service
+            .store
+            .read()
+            .sessions
+            .get(&session.session_id)
+            .cloned()
+            .expect("stored session");
+        assert!(stored.session_token.is_empty());
+        assert_eq!(stored.session_token_hash, session.session_token_hash);
+    }
+
+    #[test]
+    fn revoked_session_is_rejected() {
+        let service = HttpaService::new();
+        let session = service
+            .create_session(
+                CreateHttpaSessionRequest {
+                    device_id: "owner-desktop".into(),
+                    device_capabilities: Vec::new(),
+                    action_allowlist: Vec::new(),
+                    requested_policy: None,
+                },
+                true,
+            )
+            .expect("session");
+        assert!(
+            service
+                .verify_session(&session.session_id, &session.session_token)
+                .is_ok()
+        );
+        assert!(service.revoke_session(&session.session_id));
+        assert!(
+            service
+                .verify_session(&session.session_id, &session.session_token)
+                .is_err()
+        );
+        // Idempotent.
+        assert!(!service.revoke_session(&session.session_id));
+    }
+
+    #[test]
+    fn expired_session_is_rejected_and_purged() {
+        let service = HttpaService::new();
+        let session = service
+            .create_session(
+                CreateHttpaSessionRequest {
+                    device_id: "owner-desktop".into(),
+                    device_capabilities: Vec::new(),
+                    action_allowlist: Vec::new(),
+                    requested_policy: None,
+                },
+                true,
+            )
+            .expect("session");
+        service
+            .store
+            .write()
+            .sessions
+            .get_mut(&session.session_id)
+            .expect("stored session")
+            .expires_at_ms = now_ms() - 1;
+        assert!(
+            service
+                .verify_session(&session.session_id, &session.session_token)
+                .is_err()
+        );
+        assert_eq!(service.active_session_count(), 0);
+    }
+
+    #[test]
+    fn session_intent_quota_is_enforced() {
+        let service = HttpaService::new();
+        let session = service
+            .create_session(
+                CreateHttpaSessionRequest {
+                    device_id: "owner-desktop".into(),
+                    device_capabilities: Vec::new(),
+                    action_allowlist: Vec::new(),
+                    requested_policy: None,
+                },
+                true,
+            )
+            .expect("session");
+        service
+            .store
+            .write()
+            .session_use_counts
+            .insert(session.session_id.clone(), MAX_INTENTS_PER_SESSION);
+        let error = service
+            .verify_session(&session.session_id, &session.session_token)
+            .expect_err("quota should block");
+        assert!(error.to_string().contains("quota"));
+    }
+
+    #[test]
+    fn receipts_are_recorded_and_retrievable() {
+        let service = HttpaService::new();
+        let receipt = service
             .record_receipt("trace_one", "test", &serde_json::json!({"a": 1}))
             .expect("receipt");
-        let second = service
-            .record_receipt("trace_two", "test", &serde_json::json!({"b": 2}))
-            .expect("receipt");
-
-        assert_eq!(second.previous_hash, first.block_hash);
-        assert!(service.verify_ledger().valid);
+        assert!(!receipt.payload_hash.is_empty());
+        let fetched = service.get_receipt(&receipt.receipt_id).expect("stored");
+        assert_eq!(fetched.receipt_id, receipt.receipt_id);
     }
 }

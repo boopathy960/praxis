@@ -13,9 +13,32 @@ use sha3::{Digest, Sha3_256};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveVersion {
     active_binary: String,
-    previous_binary: Option<String>,
+    /// Rollback history, oldest first / most-recent last. Each failed promotion
+    /// pops the last entry, so the supervisor can recover across more than one
+    /// bad swap instead of being stranded after the first rollback.
+    #[serde(default, alias = "previous_binary", deserialize_with = "de_history")]
+    previous_binaries: Vec<String>,
     signature: String,
     promoted_at_ms: u128,
+}
+
+/// Accept either the new `previous_binaries` array or a legacy scalar/`null`
+/// `previous_binary`, so old manifests still load.
+fn de_history<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum History {
+        List(Vec<String>),
+        One(Option<String>),
+    }
+    Ok(match History::deserialize(deserializer)? {
+        History::List(list) => list,
+        History::One(Some(one)) => vec![one],
+        History::One(None) => Vec::new(),
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,20 +49,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| default_server_binary());
     let mut active = load_active_version(&manifest_path).unwrap_or_else(|| ActiveVersion {
         active_binary: fallback_binary.to_string_lossy().into_owned(),
-        previous_binary: None,
+        previous_binaries: Vec::new(),
         signature: file_signature(&fallback_binary).unwrap_or_default(),
         promoted_at_ms: now_ms(),
     });
     verify_version(&active)?;
+    eprintln!("[sup] starting; active={}", active.active_binary);
     let mut child = launch(&active.active_binary)?;
-    if !wait_until_ready(Duration::from_secs(30)) {
+    let startup_ready = wait_until_ready(Duration::from_secs(30));
+    eprintln!("[sup] startup readiness of active = {startup_ready}");
+    if !startup_ready {
         child.kill()?;
         child.wait()?;
         active = rollback(&active, &manifest_path)?;
+        eprintln!("[sup] STARTUP ROLLBACK -> active={}", active.active_binary);
         child = launch(&active.active_binary)?;
         if !wait_until_ready(Duration::from_secs(30)) {
             return Err("active and rollback Astra server binaries both failed readiness".into());
         }
+        eprintln!("[sup] rollback binary is ready");
     }
 
     let mut failures = 0usize;
@@ -48,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(next) = load_active_version(&manifest_path)
             && next.signature != active.signature
         {
+            eprintln!("[sup] promotion detected -> active={}", next.active_binary);
             verify_version(&next)?;
             child.kill()?;
             child.wait()?;
@@ -60,6 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 child.kill()?;
                 child.wait()?;
                 active = rollback(&next, &manifest_path)?;
+                eprintln!(
+                    "[sup] PROMOTION ROLLBACK -> active={}",
+                    active.active_binary
+                );
                 child = launch(&active.active_binary)?;
                 if !wait_until_ready(Duration::from_secs(30)) {
                     return Err("automatic promotion rollback failed readiness".into());
@@ -68,17 +101,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if child.try_wait()?.is_some() || !ready() {
             failures += 1;
+            eprintln!("[sup] health check failed; failures={failures}");
         } else {
             failures = 0;
         }
         if failures >= 3 {
+            eprintln!(
+                "[sup] HEALTH ROLLBACK after {failures} failures; current active={}",
+                active.active_binary
+            );
             child.kill().ok();
             child.wait().ok();
             active = rollback(&active, &manifest_path)?;
+            eprintln!("[sup] HEALTH ROLLBACK -> active={}", active.active_binary);
             child = launch(&active.active_binary)?;
             if !wait_until_ready(Duration::from_secs(30)) {
                 return Err("health-triggered rollback failed readiness".into());
             }
+            eprintln!("[sup] health rollback binary is ready");
             failures = 0;
         }
     }
@@ -93,9 +133,25 @@ fn launch(binary: &str) -> Result<Child, Box<dyn std::error::Error>> {
 }
 
 fn load_active_version(path: &Path) -> Option<ActiveVersion> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
+    // A missing manifest is the normal first-run case — fall back silently.
+    let content = fs::read_to_string(path).ok()?;
+    // Tolerate a leading UTF-8 BOM: some editors and PowerShell's `Set-Content
+    // -Encoding utf8` prepend one, and serde_json cannot parse it. Without this,
+    // a BOM'd manifest is silently ignored and a real promotion is dropped.
+    let content = content.trim_start_matches('\u{feff}');
+    match serde_json::from_str(content) {
+        Ok(version) => Some(version),
+        Err(error) => {
+            // The manifest exists but is corrupt — say so loudly rather than
+            // silently falling back to the shipped binary and masking it.
+            eprintln!(
+                "[sup] active_version.json at {} is present but unparseable ({error}); \
+                 ignoring it and keeping the current binary",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn verify_version(version: &ActiveVersion) -> Result<(), Box<dyn std::error::Error>> {
@@ -111,14 +167,16 @@ fn rollback(
     current: &ActiveVersion,
     manifest_path: &Path,
 ) -> Result<ActiveVersion, Box<dyn std::error::Error>> {
-    let previous = current
-        .previous_binary
-        .as_ref()
+    // Pop the most recent previous binary; the remaining history is preserved so
+    // a subsequent failure can roll back again (N-deep), instead of being stranded.
+    let mut history = current.previous_binaries.clone();
+    let previous = history
+        .pop()
         .ok_or("no previous Astra server binary is available for rollback")?;
-    let previous_path = PathBuf::from(previous);
+    let previous_path = PathBuf::from(&previous);
     let rolled_back = ActiveVersion {
-        active_binary: previous.clone(),
-        previous_binary: None,
+        active_binary: previous,
+        previous_binaries: history,
         signature: file_signature(&previous_path)?,
         promoted_at_ms: now_ms(),
     };
@@ -211,7 +269,7 @@ mod tests {
         fs::write(&binary, b"version-one").expect("write");
         let version = ActiveVersion {
             active_binary: binary.to_string_lossy().into_owned(),
-            previous_binary: None,
+            previous_binaries: Vec::new(),
             signature: file_signature(&binary).expect("signature"),
             promoted_at_ms: now_ms(),
         };
@@ -222,23 +280,80 @@ mod tests {
     }
 
     #[test]
-    fn rollback_restores_previous_binary_manifest() {
+    fn rollback_is_n_deep_and_preserves_history() {
         let dir = temp_dir("rollback");
         fs::create_dir_all(&dir).expect("dir");
-        let current = dir.join("current.bin");
-        let previous = dir.join("previous.bin");
-        fs::write(&current, b"current").expect("current");
-        fs::write(&previous, b"previous").expect("previous");
+        let v1 = dir.join("v1.bin");
+        let v2 = dir.join("v2.bin");
+        let v3 = dir.join("v3.bin");
+        fs::write(&v1, b"v1").expect("v1");
+        fs::write(&v2, b"v2").expect("v2");
+        fs::write(&v3, b"v3").expect("v3");
         let manifest = dir.join("active_version.json");
+
+        // Active v3 with a two-deep history [v1, v2].
         let version = ActiveVersion {
-            active_binary: current.to_string_lossy().into_owned(),
-            previous_binary: Some(previous.to_string_lossy().into_owned()),
-            signature: file_signature(&current).expect("signature"),
+            active_binary: v3.to_string_lossy().into_owned(),
+            previous_binaries: vec![
+                v1.to_string_lossy().into_owned(),
+                v2.to_string_lossy().into_owned(),
+            ],
+            signature: file_signature(&v3).expect("signature"),
             promoted_at_ms: now_ms(),
         };
-        let restored = rollback(&version, &manifest).expect("rollback");
-        assert_eq!(restored.active_binary, previous.to_string_lossy());
-        verify_version(&restored).expect("restored signature");
+
+        // First rollback -> v2, history shrinks to [v1].
+        let r1 = rollback(&version, &manifest).expect("rollback 1");
+        assert_eq!(r1.active_binary, v2.to_string_lossy());
+        assert_eq!(r1.previous_binaries, vec![v1.to_string_lossy().to_string()]);
+        verify_version(&r1).expect("v2 signature");
+
+        // Second rollback -> v1, history empties (N-deep, not stranded after one).
+        let r2 = rollback(&r1, &manifest).expect("rollback 2");
+        assert_eq!(r2.active_binary, v1.to_string_lossy());
+        assert!(r2.previous_binaries.is_empty());
+        verify_version(&r2).expect("v1 signature");
+
+        // No history left -> rollback errors rather than panicking.
+        assert!(rollback(&r2, &manifest).is_err());
+
+        // A legacy single `previous_binary` manifest still loads.
+        let legacy = format!(
+            r#"{{"active_binary":"{}","previous_binary":"{}","signature":"x","promoted_at_ms":1}}"#,
+            v3.to_string_lossy().replace('\\', "\\\\"),
+            v1.to_string_lossy().replace('\\', "\\\\")
+        );
+        fs::write(&manifest, legacy).expect("legacy");
+        let loaded = load_active_version(&manifest).expect("legacy loads");
+        assert_eq!(
+            loaded.previous_binaries,
+            vec![v1.to_string_lossy().to_string()]
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_tolerates_a_utf8_bom_and_flags_corruption() {
+        let dir = temp_dir("load");
+        fs::create_dir_all(&dir).expect("dir");
+        let manifest = dir.join("active_version.json");
+        let json = r#"{"active_binary":"a.exe","previous_binary":"b.exe","signature":"deadbeef","promoted_at_ms":1}"#;
+
+        // A BOM-prefixed manifest (as PowerShell's `Set-Content -Encoding utf8`
+        // writes) must still load — otherwise a real promotion is silently dropped.
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(json.as_bytes());
+        fs::write(&manifest, &bom).expect("write bom");
+        let loaded = load_active_version(&manifest).expect("BOM manifest must load");
+        assert_eq!(loaded.active_binary, "a.exe");
+        // The legacy scalar `previous_binary` is migrated into the history vec.
+        assert_eq!(loaded.previous_binaries, vec!["b.exe".to_string()]);
+
+        // A corrupt manifest returns None (and logs); a missing one also None.
+        fs::write(&manifest, b"{ not json").expect("write garbage");
+        assert!(load_active_version(&manifest).is_none());
+        assert!(load_active_version(&dir.join("absent.json")).is_none());
         fs::remove_dir_all(dir).ok();
     }
 }

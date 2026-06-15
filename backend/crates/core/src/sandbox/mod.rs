@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -11,7 +11,9 @@ use url::Url;
 
 use crate::common::{AppError, TenantScope, new_id, now_ms, sha3_hex};
 
-const GENESIS_HASH: &str = "GENESIS";
+/// Principal key used for monitor-wide seals that must refuse every caller,
+/// not just one session.
+const GLOBAL_PRINCIPAL: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +293,22 @@ pub struct SandboxPolicy {
     pub max_control_rounds: u8,
     pub max_recursive_depth: u8,
     pub limits: SandboxResourceLimits,
+    /// Consecutive hard denials from one principal before the perimeter seals
+    /// it into a timed lockdown. 0 disables the intrusion-response loop.
+    pub intrusion_max_denials: u32,
+    /// How long a tripped lockdown holds a principal sealed out, in ms.
+    pub intrusion_lockdown_ms: u64,
+    /// Hard cap on the number of processes a sandboxed container may spawn.
+    pub pids_limit: u32,
+    /// Mount the container root filesystem read-only (writes confined to the
+    /// workspace volume and an ephemeral tmpfs).
+    pub readonly_rootfs: bool,
+    /// Optional `uid:gid` the sandboxed process is forced to run as.
+    pub run_as_user: Option<String>,
+    /// Planted decoy markers ("honeytokens"): fake-but-enticing secret names /
+    /// paths that no legitimate action would ever reference. Touching one is a
+    /// near-certain intrusion signal and trips an immediate seal.
+    pub honeypot_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +324,11 @@ pub struct SandboxRuntimeStatus {
     pub reference_monitor: String,
     pub max_control_rounds: u8,
     pub max_recursive_depth: u8,
+    pub intrusion_max_denials: u32,
+    pub intrusion_lockdown_ms: u64,
+    pub active_lockdowns: usize,
+    /// Total recorded intrusion attempts (breakout + honeypot) in the feed.
+    pub threat_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,24 +354,25 @@ pub struct SandboxAuditEntry {
     pub decision: SandboxDecision,
     pub enforced_action: Option<SandboxAction>,
     pub observation_hash: String,
-    pub previous_hash: String,
-    pub entry_hash: String,
     pub receipt_hash: String,
     pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SandboxAuditVerification {
-    pub valid: bool,
-    pub entry_count: usize,
-    pub latest_hash: Option<String>,
-    pub tamper_index: Option<usize>,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxNormalizeRequest {
     pub raw_request: serde_json::Value,
+}
+
+/// One recorded intrusion attempt in the threat-intel feed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxThreatEvent {
+    pub event_id: String,
+    pub principal_key: String,
+    /// `breakout` (explicit escape vector) or `honeypot` (decoy touched).
+    pub signal_kind: String,
+    pub marker: String,
+    pub action_id: String,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -408,9 +432,33 @@ impl SandboxRuntimeConfig {
                     memory_mb: env_u64("ASTRA_SANDBOX_MEMORY_MB", 256),
                     cpu_units: env_u64("ASTRA_SANDBOX_CPU_UNITS", 1) as u32,
                 },
+                intrusion_max_denials: env_u64("ASTRA_SANDBOX_INTRUSION_MAX_DENIALS", 12) as u32,
+                intrusion_lockdown_ms: env_u64("ASTRA_SANDBOX_LOCKDOWN_MS", 300_000),
+                pids_limit: env_u64("ASTRA_SANDBOX_PIDS_LIMIT", 128) as u32,
+                readonly_rootfs: env_bool("ASTRA_SANDBOX_READONLY_ROOTFS", true),
+                run_as_user: env::var("ASTRA_SANDBOX_RUN_AS")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                honeypot_tokens: default_honeytokens(),
             },
         }
     }
+}
+
+/// The built-in decoy markers, plus any added via `ASTRA_SANDBOX_HONEYTOKENS`.
+/// These are bait: names/paths that look like high-value secrets but are fake,
+/// so anything touching them is an intruder, not a legitimate workload.
+fn default_honeytokens() -> Vec<String> {
+    let mut tokens = vec![
+        "astra_root_token".to_string(),
+        "/opt/astra/secrets/master.key".to_string(),
+        "/api/internal/root-keys".to_string(),
+        "wallet_seed_backup".to_string(),
+        "x-astra-admin-token-backup".to_string(),
+    ];
+    tokens.extend(split_env("ASTRA_SANDBOX_HONEYTOKENS"));
+    tokens
 }
 
 #[derive(Clone)]
@@ -441,6 +489,14 @@ impl SandboxService {
 
     pub fn status(&self) -> Result<SandboxRuntimeStatus, AppError> {
         let runtime = docker_status();
+        let (audit_entries, active_lockdowns, threat_events) = {
+            let store = self.store.lock();
+            (
+                count_audit_entries(&store)?,
+                count_active_lockdowns(&store)?,
+                count_threats(&store)?,
+            )
+        };
         Ok(SandboxRuntimeStatus {
             mode: self.config.mode,
             runtime: self.config.runtime,
@@ -452,11 +508,15 @@ impl SandboxService {
             runtime_version: runtime,
             block_by_default: self.config.policy.block_by_default,
             container_required: self.config.policy.container_required,
-            audit_entries: count_audit_entries(&self.store.lock())?,
+            audit_entries,
             workspace_root: self.config.workspace_root.to_string_lossy().to_string(),
             reference_monitor: "astra_unified_reference_monitor".into(),
             max_control_rounds: self.config.policy.max_control_rounds,
             max_recursive_depth: self.config.policy.max_recursive_depth,
+            intrusion_max_denials: self.config.policy.intrusion_max_denials,
+            intrusion_lockdown_ms: self.config.policy.intrusion_lockdown_ms,
+            active_lockdowns,
+            threat_events,
         })
     }
 
@@ -487,6 +547,36 @@ impl SandboxService {
         requested_execution: bool,
     ) -> Result<SandboxReceipt, AppError> {
         let normalized = normalize_action(action);
+        let principal = principal_key(&normalized);
+
+        // Lockdown gate — a sealed principal (denial-streak intrusion response)
+        // is refused before any capability is evaluated.
+        if let Some((until_ms, reason)) = self.active_lockdown(&principal)? {
+            return self.sealed_receipt(&normalized, requested_execution, until_ms, reason);
+        }
+
+        // Immediate breakout tripwire — an explicit sandbox-escape or monitor-
+        // tamper attempt seals the principal on the FIRST try (it does not wait
+        // for the denial streak) and is refused before any capability evaluation
+        // or runtime touch. This is the "touch the wall and you're frozen out"
+        // response, done by containment rather than counter-attack.
+        if let Some(reason) = breakout_signal(&normalized) {
+            self.record_threat(&principal, "breakout", &reason, &normalized.action_id)?;
+            let until = self.seal_principal_now(&principal, &reason)?;
+            return self.sealed_receipt(&normalized, requested_execution, until, reason);
+        }
+
+        // Honeypot tripwire — a planted decoy ("honeytoken") was touched. Same
+        // immediate seal, and the attempt is recorded to the threat-intel feed
+        // for the governance layer. Bounded deception: we never execute it, never
+        // hold the caller in a loop, and never reach back to it.
+        if let Some(token) = honeypot_trip(&normalized, &self.config.policy.honeypot_tokens) {
+            let reason = format!("honeypot decoy tripped: {token}");
+            self.record_threat(&principal, "honeypot", &token, &normalized.action_id)?;
+            let until = self.seal_principal_now(&principal, &reason)?;
+            return self.sealed_receipt(&normalized, requested_execution, until, reason);
+        }
+
         let (mut decision, effective, rounds, rewrites_applied) =
             self.run_control_loop(normalized.clone());
 
@@ -602,6 +692,15 @@ impl SandboxService {
             self.record_usage(&effective)?;
         }
 
+        // Perimeter layer 3 — intrusion-response loop. Hard denials accrue
+        // against the principal; crossing the threshold seals it out for a
+        // bounded window. Any non-denied outcome clears the streak.
+        if decision.outcome == SandboxDecisionOutcome::Deny {
+            self.register_denial(&principal)?;
+        } else {
+            self.clear_denials(&principal)?;
+        }
+
         Ok(SandboxReceipt {
             receipt_id,
             action_id: normalized.action_id,
@@ -624,6 +723,12 @@ impl SandboxService {
         let mut rounds = Vec::new();
         let mut rewrites_applied = 0_u8;
         let mut last_decision = self.evaluate_normalized(current.clone());
+        // Every action shape we have already evaluated this loop. A rewrite that
+        // reproduces a shape we have seen is making no progress, so we refuse to
+        // spin: the bounded loop is what keeps an agent from negotiating its way
+        // out one harmless-looking rewrite at a time.
+        let mut seen = HashSet::new();
+        seen.insert(action_fingerprint(&current));
 
         for round in 0..max_rounds {
             let decision = self.evaluate_normalized(current.clone());
@@ -638,6 +743,15 @@ impl SandboxService {
 
             if decision.outcome == SandboxDecisionOutcome::Rewrite {
                 if let Some(next) = decision.effective_action.clone() {
+                    if !seen.insert(action_fingerprint(&next)) {
+                        let mut stalled = decision;
+                        stalled.outcome = SandboxDecisionOutcome::Deny;
+                        stalled.reason =
+                            "sandbox control loop made no progress (rewrite cycle); failed closed"
+                                .into();
+                        stalled.monitor.m0 = false;
+                        return (stalled, current, rounds, rewrites_applied);
+                    }
                     rewrites_applied = rewrites_applied.saturating_add(1);
                     current = next;
                     current.control_depth = current.control_depth.saturating_add(1);
@@ -661,67 +775,20 @@ impl SandboxService {
         let store = self.store.lock();
         let mut statement = store
             .prepare(
-                "SELECT payload, previous_hash, entry_hash FROM sandbox_audit
+                "SELECT payload FROM sandbox_audit
                  ORDER BY rowid DESC LIMIT ?1",
             )
             .map_err(sql_error)?;
         let mut entries = statement
-            .query_map([limit], |row| {
-                let payload: String = row.get(0)?;
-                let previous_hash: String = row.get(1)?;
-                let entry_hash: String = row.get(2)?;
-                Ok((payload, previous_hash, entry_hash))
-            })
+            .query_map([limit], |row| row.get::<_, String>(0))
             .map_err(sql_error)?
             .map(|row| {
-                let (payload, previous_hash, entry_hash) = row.map_err(sql_error)?;
-                let mut entry: SandboxAuditEntry =
-                    serde_json::from_str(&payload).map_err(decode_error)?;
-                entry.previous_hash = previous_hash;
-                entry.entry_hash = entry_hash;
-                Ok(entry)
+                let payload = row.map_err(sql_error)?;
+                serde_json::from_str::<SandboxAuditEntry>(&payload).map_err(decode_error)
             })
             .collect::<Result<Vec<_>, AppError>>()?;
         entries.reverse();
         Ok(entries)
-    }
-
-    pub fn verify_audit(&self) -> Result<SandboxAuditVerification, AppError> {
-        let entries = self.audit(usize::MAX)?;
-        let mut previous = GENESIS_HASH.to_string();
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.previous_hash != previous {
-                return Ok(SandboxAuditVerification {
-                    valid: false,
-                    entry_count: entries.len(),
-                    latest_hash: entries.last().map(|entry| entry.entry_hash.clone()),
-                    tamper_index: Some(index),
-                    reason: Some("previous hash mismatch".into()),
-                });
-            }
-            let mut recomputed = entry.clone();
-            recomputed.previous_hash = previous.clone();
-            recomputed.entry_hash.clear();
-            let payload = serde_json::to_string(&recomputed).map_err(serialize_error)?;
-            let expected = sha3_hex(format!("{previous}:{payload}").as_bytes());
-            if entry.entry_hash != expected {
-                return Ok(SandboxAuditVerification {
-                    valid: false,
-                    entry_count: entries.len(),
-                    latest_hash: entries.last().map(|entry| entry.entry_hash.clone()),
-                    tamper_index: Some(index),
-                    reason: Some("entry hash mismatch".into()),
-                });
-            }
-            previous = entry.entry_hash.clone();
-        }
-        Ok(SandboxAuditVerification {
-            valid: true,
-            entry_count: entries.len(),
-            latest_hash: entries.last().map(|entry| entry.entry_hash.clone()),
-            tamper_index: None,
-            reason: None,
-        })
     }
 
     pub fn action_for_tool_execution(
@@ -790,6 +857,24 @@ impl SandboxService {
             payload,
             capabilities: tools.into_iter().map(SandboxCapability::Tool).collect(),
             approval_token: owner_authorized.then(|| "owner_authorized_session".into()),
+            ..SandboxAction::default()
+        }
+    }
+
+    /// Builds a `SpendPayment`-class action for a real-money operation. These
+    /// always require approval and never auto-execute.
+    pub fn action_for_spend_payment(
+        &self,
+        purpose: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> SandboxAction {
+        let purpose = purpose.into();
+        SandboxAction {
+            kind: SandboxActionKind::SpendPayment,
+            tool: Some(purpose.clone()),
+            raw_request: serde_json::json!({ "purpose": purpose, "payload": &payload }),
+            payload,
+            capabilities: vec![SandboxCapability::Tool("spend_payment".into())],
             ..SandboxAction::default()
         }
     }
@@ -1020,13 +1105,46 @@ impl SandboxService {
         })?;
         let timeout_seconds = (action.resource_limits.timeout_ms / 1_000).clamp(1, 300);
         let shell_command = format!("timeout {timeout_seconds}s {command}");
-        let output = Command::new("docker")
+        let memory_mb = action.resource_limits.memory_mb;
+        let cpus = action.resource_limits.cpu_units.max(1);
+        let pids_limit = self.config.policy.pids_limit.max(1);
+
+        // Containment baseline: no network, no Linux capabilities, no privilege
+        // escalation, swap pinned to the memory ceiling, and process/file-handle
+        // ceilings. These are the walls an agent running code inside cannot
+        // climb back over.
+        let mut docker = Command::new("docker");
+        docker
             .arg("run")
             .arg("--rm")
             .arg("--network")
             .arg("none")
+            .arg("--cap-drop")
+            .arg("ALL")
+            .arg("--security-opt")
+            .arg("no-new-privileges")
             .arg("--memory")
-            .arg(format!("{}m", action.resource_limits.memory_mb))
+            .arg(format!("{memory_mb}m"))
+            .arg("--memory-swap")
+            .arg(format!("{memory_mb}m"))
+            .arg("--cpus")
+            .arg(cpus.to_string())
+            .arg("--pids-limit")
+            .arg(pids_limit.to_string())
+            .arg("--ulimit")
+            .arg("nofile=256:512")
+            .arg("--ulimit")
+            .arg("nproc=256:512");
+        if self.config.policy.readonly_rootfs {
+            docker
+                .arg("--read-only")
+                .arg("--tmpfs")
+                .arg("/tmp:rw,noexec,nosuid,size=64m");
+        }
+        if let Some(user) = self.config.policy.run_as_user.as_deref() {
+            docker.arg("--user").arg(user);
+        }
+        let output = docker
             .arg("-v")
             .arg(format!(
                 "{}:/workspace:rw",
@@ -1064,8 +1182,7 @@ impl SandboxService {
         receipt_hash: &str,
     ) -> Result<String, AppError> {
         let store = self.store.lock();
-        let previous_hash = latest_audit_hash(&store)?.unwrap_or_else(|| GENESIS_HASH.into());
-        let mut entry = SandboxAuditEntry {
+        let entry = SandboxAuditEntry {
             entry_id: new_id("sandbox_audit"),
             action_id: action.action_id.clone(),
             raw_request_hash: sha3_hex(action.raw_request.to_string().as_bytes()),
@@ -1074,19 +1191,12 @@ impl SandboxService {
             decision: decision.clone(),
             enforced_action,
             observation_hash: observation_hash.into(),
-            previous_hash: previous_hash.clone(),
-            entry_hash: String::new(),
             receipt_hash: receipt_hash.into(),
             created_at_ms: now_ms(),
         };
         let payload = serde_json::to_string(&entry).map_err(serialize_error)?;
-        let entry_hash = sha3_hex(format!("{previous_hash}:{payload}").as_bytes());
-        entry.entry_hash = entry_hash.clone();
-        let payload_without_hash = {
-            let mut without_hash = entry.clone();
-            without_hash.entry_hash.clear();
-            serde_json::to_string(&without_hash).map_err(serialize_error)?
-        };
+        // Plain content hash of this record — no chain linkage to prior records.
+        let audit_hash = sha3_hex(payload.as_bytes());
         store
             .execute(
                 "INSERT INTO sandbox_audit
@@ -1095,15 +1205,15 @@ impl SandboxService {
                 params![
                     entry.entry_id,
                     entry.action_id,
-                    payload_without_hash,
-                    previous_hash,
-                    entry_hash,
+                    payload,
+                    "",
+                    audit_hash,
                     receipt_hash,
                     entry.created_at_ms,
                 ],
             )
             .map_err(sql_error)?;
-        Ok(entry_hash)
+        Ok(audit_hash)
     }
 
     fn record_usage(&self, action: &SandboxAction) -> Result<(), AppError> {
@@ -1128,17 +1238,232 @@ impl SandboxService {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn tamper_latest_entry_for_test(&self) -> Result<(), AppError> {
+    /// O(1) integrity check of the newest audit record. Returns a reason when
+    /// Returns `(locked_until_ms, reason)` when the principal — or the whole
+    /// monitor via the global seal — is currently locked out.
+    fn active_lockdown(&self, principal: &str) -> Result<Option<(i64, String)>, AppError> {
+        let now = now_ms();
+        let store = self.store.lock();
+        let mut statement = store
+            .prepare(
+                "SELECT locked_until_ms, COALESCE(last_reason, '') FROM sandbox_perimeter
+                 WHERE principal_key IN (?1, ?2) AND locked_until_ms > ?3
+                 ORDER BY locked_until_ms DESC LIMIT 1",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_row(params![principal, GLOBAL_PRINCIPAL, now], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Immediately seal a principal into the intrusion-lockdown window — used by
+    /// the breakout tripwire, which does not wait for the denial streak. Returns
+    /// the lockdown-until timestamp.
+    fn seal_principal_now(&self, principal: &str, reason: &str) -> Result<i64, AppError> {
+        let now = now_ms();
+        let until = now + self.config.policy.intrusion_lockdown_ms as i64;
         self.store
             .lock()
             .execute(
-                "UPDATE sandbox_audit SET payload=json_set(payload, '$.observation_hash', 'tampered')
-                 WHERE rowid=(SELECT max(rowid) FROM sandbox_audit)",
+                "INSERT INTO sandbox_perimeter
+                   (principal_key, consecutive_denials, locked_until_ms, last_reason, updated_at_ms)
+                 VALUES (?1, 1, ?2, ?3, ?4)
+                 ON CONFLICT(principal_key) DO UPDATE SET
+                   consecutive_denials = consecutive_denials + 1,
+                   locked_until_ms = ?2,
+                   last_reason = ?3,
+                   updated_at_ms = ?4",
+                params![principal, until, reason, now],
+            )
+            .map_err(sql_error)?;
+        Ok(until)
+    }
+
+    /// Append an intrusion attempt (breakout or honeypot) to the threat-intel
+    /// feed the governance layer reviews. Retention is capped so it stays bounded.
+    fn record_threat(
+        &self,
+        principal: &str,
+        signal_kind: &str,
+        marker: &str,
+        action_id: &str,
+    ) -> Result<(), AppError> {
+        let store = self.store.lock();
+        store
+            .execute(
+                "INSERT INTO sandbox_threats
+                   (event_id, principal_key, signal_kind, marker, action_id, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new_id("sandbox_threat"),
+                    principal,
+                    signal_kind,
+                    marker,
+                    action_id,
+                    now_ms()
+                ],
+            )
+            .map_err(sql_error)?;
+        store
+            .execute(
+                "DELETE FROM sandbox_threats WHERE event_id NOT IN (
+                     SELECT event_id FROM sandbox_threats ORDER BY created_at_ms DESC LIMIT 5000
+                 )",
                 [],
             )
             .map_err(sql_error)?;
         Ok(())
+    }
+
+    /// The most recent intrusion attempts, newest first — the governance feed.
+    pub fn threat_events(&self, limit: usize) -> Result<Vec<SandboxThreatEvent>, AppError> {
+        let limit = limit.clamp(1, 1000);
+        let store = self.store.lock();
+        let mut statement = store
+            .prepare(
+                "SELECT event_id, principal_key, signal_kind, marker, action_id, created_at_ms
+                 FROM sandbox_threats ORDER BY created_at_ms DESC LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![limit], |row| {
+                Ok(SandboxThreatEvent {
+                    event_id: row.get(0)?,
+                    principal_key: row.get(1)?,
+                    signal_kind: row.get(2)?,
+                    marker: row.get(3)?,
+                    action_id: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })
+            .map_err(sql_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
+    }
+
+    /// Records a hard denial and seals the principal once the streak crosses
+    /// the configured intrusion threshold.
+    fn register_denial(&self, principal: &str) -> Result<(), AppError> {
+        let threshold = self.config.policy.intrusion_max_denials;
+        let now = now_ms();
+        let store = self.store.lock();
+        store
+            .execute(
+                "INSERT INTO sandbox_perimeter
+                   (principal_key, consecutive_denials, locked_until_ms, updated_at_ms)
+                 VALUES (?1, 1, 0, ?2)
+                 ON CONFLICT(principal_key) DO UPDATE SET
+                   consecutive_denials = consecutive_denials + 1,
+                   updated_at_ms = ?2",
+                params![principal, now],
+            )
+            .map_err(sql_error)?;
+        if threshold == 0 {
+            return Ok(());
+        }
+        let count: u32 = store
+            .query_row(
+                "SELECT consecutive_denials FROM sandbox_perimeter WHERE principal_key = ?1",
+                params![principal],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if count >= threshold {
+            let until = now + self.config.policy.intrusion_lockdown_ms as i64;
+            store
+                .execute(
+                    "UPDATE sandbox_perimeter
+                     SET locked_until_ms = ?2, last_reason = ?3
+                     WHERE principal_key = ?1",
+                    params![
+                        principal,
+                        until,
+                        "consecutive policy denials exceeded intrusion threshold"
+                    ],
+                )
+                .map_err(sql_error)?;
+        }
+        Ok(())
+    }
+
+    /// Resets the denial streak for a principal after any non-denied outcome.
+    /// An existing active lockdown window is left untouched.
+    fn clear_denials(&self, principal: &str) -> Result<(), AppError> {
+        self.store
+            .lock()
+            .execute(
+                "UPDATE sandbox_perimeter SET consecutive_denials = 0, updated_at_ms = ?2
+                 WHERE principal_key = ?1 AND locked_until_ms <= ?2",
+                params![principal, now_ms()],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    /// Builds and audits a deny receipt for an action refused by the perimeter
+    /// lockdown gate, without evaluating capabilities or touching the runtime.
+    fn sealed_receipt(
+        &self,
+        normalized: &SandboxAction,
+        requested_execution: bool,
+        until_ms: i64,
+        reason: String,
+    ) -> Result<SandboxReceipt, AppError> {
+        let mut monitor = SandboxMonitorComponents::all_true();
+        monitor.m0 = false;
+        let decision = SandboxDecision {
+            decision_id: new_id("sandbox_decision"),
+            action_id: normalized.action_id.clone(),
+            outcome: SandboxDecisionOutcome::Deny,
+            reason: format!("perimeter lockdown active until {until_ms}ms: {reason}"),
+            monitor,
+            rewrite: None,
+            effective_action: Some(normalized.clone()),
+            policy_id: self.config.policy.policy_id.clone(),
+            created_at_ms: now_ms(),
+        };
+        let observation = serde_json::json!({
+            "status": "perimeter_lockdown",
+            "executed": false,
+            "reference_monitor": "astra_unified_reference_monitor",
+            "protocol": "httpa",
+            "requested_execution": requested_execution,
+            "locked_until_ms": until_ms,
+            "reason": decision.reason,
+        });
+        let observation_hash = sha3_hex(observation.to_string().as_bytes());
+        let receipt_id = new_id("sandbox_receipt");
+        let receipt_hash = sha3_hex(
+            serde_json::json!({
+                "receipt_id": receipt_id,
+                "action_id": normalized.action_id,
+                "decision": decision,
+                "executed": false,
+                "observation_hash": observation_hash,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let audit_hash = self.append_audit(
+            normalized,
+            &decision,
+            None,
+            &observation_hash,
+            &receipt_hash,
+        )?;
+        Ok(SandboxReceipt {
+            receipt_id,
+            action_id: normalized.action_id.clone(),
+            decision,
+            executed: false,
+            observation,
+            observation_hash,
+            audit_hash,
+            receipt_hash,
+            created_at_ms: now_ms(),
+        })
     }
 }
 
@@ -1367,25 +1692,37 @@ fn initialize_store(connection: &Connection) -> Result<(), AppError> {
                 risk_spent REAL NOT NULL,
                 PRIMARY KEY (tenant_key, session_id, period)
             );
+            CREATE TABLE IF NOT EXISTS sandbox_perimeter (
+                principal_key TEXT PRIMARY KEY,
+                consecutive_denials INTEGER NOT NULL DEFAULT 0,
+                locked_until_ms INTEGER NOT NULL DEFAULT 0,
+                last_reason TEXT,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sandbox_threats (
+                event_id TEXT PRIMARY KEY,
+                principal_key TEXT NOT NULL,
+                signal_kind TEXT NOT NULL,
+                marker TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
             ",
         )
-        .map_err(sql_error)
-}
-
-fn latest_audit_hash(connection: &Connection) -> Result<Option<String>, AppError> {
-    connection
-        .query_row(
-            "SELECT entry_hash FROM sandbox_audit ORDER BY rowid DESC LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
         .map_err(sql_error)
 }
 
 fn count_audit_entries(connection: &Connection) -> Result<usize, AppError> {
     connection
         .query_row("SELECT COUNT(*) FROM sandbox_audit", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .map_err(sql_error)
+}
+
+fn count_threats(connection: &Connection) -> Result<usize, AppError> {
+    connection
+        .query_row("SELECT COUNT(*) FROM sandbox_threats", [], |row| {
             row.get::<_, usize>(0)
         })
         .map_err(sql_error)
@@ -1411,6 +1748,139 @@ fn session_risk_spent(
         .optional()
         .map(|value| value.unwrap_or(0.0))
         .map_err(sql_error)
+}
+
+fn count_active_lockdowns(connection: &Connection) -> Result<usize, AppError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sandbox_perimeter WHERE locked_until_ms > ?1",
+            params![now_ms()],
+            |row| row.get::<_, usize>(0),
+        )
+        .map_err(sql_error)
+}
+
+/// Identity the perimeter loop accounts against: the tenant scope plus the
+/// session. Denials and lockdowns are tracked per principal so one abusive
+/// caller cannot lock out the rest of the system.
+fn principal_key(action: &SandboxAction) -> String {
+    let session = action
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "default".into());
+    format!("{}|{session}", tenant_key(action))
+}
+
+/// Detects an explicit sandbox-escape or reference-monitor-tamper attempt in an
+/// action. These are not ordinary policy denials: touching any of these patterns
+/// trips an *immediate* seal of the offending principal (containment, never
+/// counter-attack), rather than waiting for the slow denial streak.
+/// Lower-cased concatenation of every place an escape or decoy string could
+/// hide in an action — command, path, url, host, args, and the raw request.
+fn action_haystack(action: &SandboxAction) -> String {
+    let mut haystack = String::new();
+    for part in [
+        action.command.as_deref(),
+        action.path.as_deref(),
+        action.url.as_deref(),
+        action.host.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        haystack.push_str(part);
+        haystack.push(' ');
+    }
+    for arg in &action.args {
+        haystack.push_str(arg);
+        haystack.push(' ');
+    }
+    haystack.push_str(&action.raw_request.to_string());
+    haystack.to_ascii_lowercase()
+}
+
+/// A planted decoy ("honeytoken") was touched — a near-certain intrusion signal.
+/// Bounded and O(1): a substring scan, no loop, no resources held, nothing sent
+/// to the toucher. Returns the decoy that was hit.
+fn honeypot_trip(action: &SandboxAction, tokens: &[String]) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let h = action_haystack(action);
+    tokens
+        .iter()
+        .find(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            !token.is_empty() && h.contains(&token)
+        })
+        .cloned()
+}
+
+fn breakout_signal(action: &SandboxAction) -> Option<String> {
+    let h = action_haystack(action);
+
+    // (needle, why it is an escape/tamper attempt)
+    const ESCAPE_MARKERS: &[(&str, &str)] = &[
+        ("docker.sock", "container escape: docker socket access"),
+        ("/proc/1/", "container escape: host PID namespace access"),
+        ("/proc/sys", "host introspection: /proc/sys access"),
+        ("/sys/fs/cgroup", "container escape: cgroup manipulation"),
+        ("nsenter", "container escape: namespace entry"),
+        ("unshare", "container escape: namespace manipulation"),
+        ("setns", "container escape: namespace entry"),
+        ("chroot", "container escape: chroot attempt"),
+        ("pivot_root", "container escape: pivot_root attempt"),
+        ("modprobe", "kernel tamper: kernel module load"),
+        ("insmod", "kernel tamper: kernel module load"),
+        ("setcap", "privilege escalation: capability set"),
+        ("ptrace", "privilege escalation: ptrace"),
+        ("/dev/mem", "host memory access"),
+        ("/dev/kmem", "host memory access"),
+        ("/etc/shadow", "credential theft: shadow file access"),
+        (
+            "sandbox.sqlite",
+            "monitor tamper: reference-monitor store access",
+        ),
+        (
+            "active_version.json",
+            "monitor tamper: promotion manifest access",
+        ),
+    ];
+    for (needle, reason) in ESCAPE_MARKERS {
+        if h.contains(needle) {
+            return Some((*reason).to_string());
+        }
+    }
+    if h.contains(" mount ") || h.starts_with("mount ") {
+        return Some("container escape: mount attempt".to_string());
+    }
+    if h.contains("../../../") {
+        return Some("path traversal beyond the workspace jail".to_string());
+    }
+    None
+}
+
+/// Stable shape of an action for control-loop cycle detection. Two actions with
+/// the same fingerprint are equivalent from the monitor's point of view, so a
+/// rewrite that reproduces one is making no forward progress.
+fn action_fingerprint(action: &SandboxAction) -> String {
+    sha3_hex(
+        serde_json::json!({
+            "kind": action.kind,
+            "command": action.command,
+            "path": action.path,
+            "url": action.url,
+            "host": action.host,
+            "provider": action.provider,
+            "tool": action.tool,
+            "timeout_ms": action.resource_limits.timeout_ms,
+            "max_output_bytes": action.resource_limits.max_output_bytes,
+            "memory_mb": action.resource_limits.memory_mb,
+            "cpu_units": action.resource_limits.cpu_units,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 fn tenant_key(action: &SandboxAction) -> String {
@@ -1444,6 +1914,18 @@ fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -1503,7 +1985,7 @@ mod tests {
         let receipt = service.execute(SandboxAction::default()).expect("receipt");
         assert!(!receipt.executed);
         assert_eq!(receipt.decision.outcome, SandboxDecisionOutcome::Deny);
-        assert_eq!(service.verify_audit().expect("verify").entry_count, 1);
+        assert_eq!(service.audit(10).expect("audit").len(), 1);
     }
 
     #[test]
@@ -1650,11 +2132,144 @@ mod tests {
     }
 
     #[test]
-    fn audit_hash_chain_detects_tampering() {
-        let service = service("tamper");
-        service.execute(SandboxAction::default()).expect("receipt");
-        assert!(service.verify_audit().expect("verify").valid);
-        service.tamper_latest_entry_for_test().expect("tamper");
-        assert!(!service.verify_audit().expect("verify").valid);
+    fn repeated_denials_trip_perimeter_lockdown() {
+        let service = service("lockdown");
+        let threshold = service.config.policy.intrusion_max_denials;
+        assert!(threshold > 0);
+        // Each unknown action is denied; the same principal keeps probing.
+        for _ in 0..threshold {
+            let receipt = service
+                .execute(SandboxAction {
+                    session_id: Some("attacker".into()),
+                    ..SandboxAction::default()
+                })
+                .expect("receipt");
+            assert_eq!(receipt.decision.outcome, SandboxDecisionOutcome::Deny);
+        }
+        // The next call is refused by the perimeter before evaluation.
+        let sealed = service
+            .execute(SandboxAction {
+                kind: SandboxActionKind::ShellExecution,
+                command: Some("echo ok".into()),
+                session_id: Some("attacker".into()),
+                ..SandboxAction::default()
+            })
+            .expect("receipt");
+        assert_eq!(sealed.decision.outcome, SandboxDecisionOutcome::Deny);
+        assert_eq!(sealed.observation["status"], "perimeter_lockdown");
+        assert_eq!(service.status().expect("status").active_lockdowns, 1);
+    }
+
+    #[test]
+    fn lockdown_is_scoped_to_the_offending_principal() {
+        let service = service("lockdown-scope");
+        let threshold = service.config.policy.intrusion_max_denials;
+        for _ in 0..threshold {
+            service
+                .execute(SandboxAction {
+                    session_id: Some("attacker".into()),
+                    ..SandboxAction::default()
+                })
+                .expect("receipt");
+        }
+        // A different principal is unaffected by the attacker's lockdown.
+        let other = service
+            .guard(
+                SandboxAction {
+                    kind: SandboxActionKind::ShellExecution,
+                    command: Some("echo ok".into()),
+                    session_id: Some("legit".into()),
+                    ..SandboxAction::default()
+                },
+                false,
+            )
+            .expect("receipt");
+        assert_ne!(other.observation["status"], "perimeter_lockdown");
+    }
+
+    #[test]
+    fn explicit_breakout_attempt_seals_on_the_first_try() {
+        let service = service("breakout");
+        // A single explicit escape attempt (touching the docker socket) must seal
+        // the principal immediately — not after the 12-strike denial streak.
+        let receipt = service
+            .execute(SandboxAction {
+                kind: SandboxActionKind::ShellExecution,
+                command: Some("cat /var/run/docker.sock".into()),
+                session_id: Some("intruder".into()),
+                ..SandboxAction::default()
+            })
+            .expect("receipt");
+        assert_eq!(receipt.decision.outcome, SandboxDecisionOutcome::Deny);
+        assert_eq!(receipt.observation["status"], "perimeter_lockdown");
+        assert_eq!(service.status().expect("status").active_lockdowns, 1);
+
+        // The intruder is now frozen out: even a benign follow-up is refused.
+        let follow_up = service
+            .execute(SandboxAction {
+                kind: SandboxActionKind::ShellExecution,
+                command: Some("echo ok".into()),
+                session_id: Some("intruder".into()),
+                ..SandboxAction::default()
+            })
+            .expect("receipt");
+        assert_eq!(follow_up.decision.outcome, SandboxDecisionOutcome::Deny);
+        assert_eq!(follow_up.observation["status"], "perimeter_lockdown");
+
+        // The detector itself flags the obvious escape vectors and clears benign input.
+        assert!(
+            breakout_signal(&SandboxAction {
+                command: Some("nsenter --target 1 --mount".into()),
+                ..SandboxAction::default()
+            })
+            .is_some()
+        );
+        assert!(
+            breakout_signal(&SandboxAction {
+                command: Some("echo hello world".into()),
+                ..SandboxAction::default()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn honeypot_decoy_seals_and_records_threat_intel() {
+        let service = service("honeypot");
+        let decoy = service.config.policy.honeypot_tokens[0].clone();
+        assert!(!decoy.is_empty());
+
+        // Touching a planted decoy seals the principal immediately...
+        let receipt = service
+            .execute(SandboxAction {
+                kind: SandboxActionKind::FileRead,
+                path: Some(decoy.clone()),
+                session_id: Some("snoop".into()),
+                ..SandboxAction::default()
+            })
+            .expect("receipt");
+        assert_eq!(receipt.decision.outcome, SandboxDecisionOutcome::Deny);
+        assert_eq!(receipt.observation["status"], "perimeter_lockdown");
+        assert_eq!(service.status().expect("status").active_lockdowns, 1);
+
+        // ...and the attempt lands in the threat-intel feed for governance.
+        let threats = service.threat_events(10).expect("threats");
+        assert!(threats.iter().any(|t| t.signal_kind == "honeypot"));
+        assert_eq!(
+            service.status().expect("status").threat_events,
+            threats.len()
+        );
+
+        // A benign action that touches no decoy does not trip the honeypot.
+        assert!(
+            honeypot_trip(
+                &SandboxAction {
+                    command: Some("echo hi".into()),
+                    ..SandboxAction::default()
+                },
+                &service.config.policy.honeypot_tokens
+            )
+            .is_none()
+        );
     }
 }

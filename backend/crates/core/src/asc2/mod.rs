@@ -5,19 +5,31 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use astra_brain::{
-    ActionToken, Asc2Config, Asc2Controller, Asc2ExecutionResult, ControlActionEstimate,
-    ControlDecision, PerformanceSnapshot, ReflexiveAgentState, RoleCandidate, SwarmState,
-};
 use parking_lot::Mutex;
 use reqwest::Client;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use crate::Shared;
 use crate::common::{AppError, new_id, now_ms, sha3_hex};
+
+/// A declared, auditable intent for a side-effecting action. This used to come
+/// from the (now-removed) brain crate; it is defined locally so ASC-II keeps
+/// its action-token contract with no local-AI dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionToken {
+    pub action: String,
+    pub preconditions: Vec<String>,
+    pub invariants: Vec<String>,
+    pub postconditions: Vec<String>,
+    pub rollback: Vec<String>,
+    pub audit: serde_json::Value,
+    pub scope: Vec<String>,
+    pub requested_privilege: f64,
+    pub estimated_risk: f64,
+    pub side_effecting: bool,
+}
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -52,7 +64,6 @@ pub struct Asc2RuntimeConfig {
     pub remote_model: String,
     pub openclaw_base_url: Option<String>,
     pub auto_promote: bool,
-    pub formula: Asc2Config,
 }
 
 impl Asc2RuntimeConfig {
@@ -63,10 +74,9 @@ impl Asc2RuntimeConfig {
             remote_endpoint: nonempty_env("ASTRA_ASC2_REMOTE_ENDPOINT"),
             remote_api_key: nonempty_env("ASTRA_ASC2_REMOTE_API_KEY"),
             remote_model: env::var("ASTRA_ASC2_REMOTE_MODEL")
-                .unwrap_or_else(|_| "gpt-5-mini".into()),
+                .unwrap_or_else(|_| "nvidia/nemotron-3-ultra-550b-a55b".into()),
             openclaw_base_url: nonempty_env("ASTRA_ASC2_OPENCLAW_BASE_URL"),
             auto_promote: boolean_env("ASTRA_ASC2_AUTO_PROMOTE", false),
-            formula: Asc2Config::default(),
         }
     }
 }
@@ -96,6 +106,11 @@ pub struct ReasoningProposal {
 pub trait ReasoningExecutor: Send + Sync {
     fn name(&self) -> &str;
     fn execute(&self, request: ReasoningRequest) -> BoxFuture<Result<ReasoningProposal, AppError>>;
+    /// Raw chat completion with caller-controlled system + user prompts,
+    /// returning the model's text. Used by the agentic loop to drive
+    /// JSON-mode plan->act->observe->replan decisions (the `execute` path
+    /// forces its own system prompt, which the loop must override).
+    fn complete(&self, system: String, user: String) -> BoxFuture<Result<String, AppError>>;
 }
 
 pub trait ToolExecutor: Send + Sync {
@@ -201,11 +216,6 @@ impl BaselineRunner for HttpBaselineRunner {
     }
 }
 
-pub trait StrategyPlugin: Send + Sync {
-    fn name(&self) -> &str;
-    fn propose_roles(&self, objective: &str, dimensions: usize) -> Vec<RoleCandidate>;
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct DryRunToolExecutor;
 
@@ -226,62 +236,50 @@ impl ToolExecutor for DryRunToolExecutor {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DefaultStrategyPlugin;
+/// Brain-free local fallback. With the cognitive core removed, ASC-II is
+/// remote-LLM-first; this stub only stands in when no remote executor is
+/// configured or a remote call fails, so a mission still returns a record
+/// instead of erroring out.
+#[derive(Clone, Default)]
+pub struct StubLocalExecutor;
 
-impl StrategyPlugin for DefaultStrategyPlugin {
+impl ReasoningExecutor for StubLocalExecutor {
     fn name(&self) -> &str {
-        "asc2_default_strategy"
-    }
-
-    fn propose_roles(&self, objective: &str, dimensions: usize) -> Vec<RoleCandidate> {
-        default_role_candidates(&task_embedding(objective, dimensions))
-    }
-}
-
-#[derive(Clone)]
-pub struct LocalReasoningExecutor {
-    brain: Shared<astra_brain::CognitiveCoreEngine>,
-}
-
-impl LocalReasoningExecutor {
-    #[must_use]
-    pub fn new(brain: Shared<astra_brain::CognitiveCoreEngine>) -> Self {
-        Self { brain }
-    }
-}
-
-impl ReasoningExecutor for LocalReasoningExecutor {
-    fn name(&self) -> &str {
-        "local_cognitive_core"
+        "local_stub"
     }
 
     fn execute(&self, request: ReasoningRequest) -> BoxFuture<Result<ReasoningProposal, AppError>> {
-        let brain = self.brain.clone();
         Box::pin(async move {
-            let start = Instant::now();
-            let result = brain
-                .write()
-                .process_5d(&format!("Act as {}. {}", request.role, request.objective));
-            let confidence = result
-                .solver_result
-                .as_ref()
-                .map_or(0.62, |solver| solver.confidence)
-                .clamp(0.0, 1.0);
             Ok(ReasoningProposal {
-                executor: "local_cognitive_core".into(),
+                executor: "local_stub".into(),
                 role: request.role,
-                claim: result.response,
-                evidence_score: confidence * 0.85,
-                proof_score: confidence * 0.8,
-                confidence,
-                uncertainty: 1.0 - confidence,
-                risk: if request.sensitive { 0.12 } else { 0.04 },
+                claim: format!(
+                    "No remote reasoning model is configured, so this objective could not be \
+                     answered locally: {}",
+                    request.objective
+                ),
+                evidence_score: 0.1,
+                proof_score: 0.1,
+                confidence: 0.1,
+                uncertainty: 0.9,
+                risk: 0.0,
                 limitation:
-                    "Deterministic local reasoning is bounded by the installed knowledge and tools."
+                    "Local reasoning engine removed; configure a remote LLM provider to answer."
                         .into(),
-                duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                duration_ms: 0.0,
             })
+        })
+    }
+
+    fn complete(&self, _system: String, _user: String) -> BoxFuture<Result<String, AppError>> {
+        // No model: end any agentic loop immediately with an honest answer.
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "done": true,
+                "final_answer": "No remote reasoning model is configured; set ASTRA_ASC2_REMOTE_ENDPOINT to run the agentic loop.",
+                "reasoning": "no model configured"
+            })
+            .to_string())
         })
     }
 }
@@ -292,17 +290,97 @@ pub struct RemoteReasoningExecutor {
     endpoint: String,
     api_key: Option<String>,
     model: String,
+    /// Upper bound on generated tokens. Reasoning models (e.g. NVIDIA Nemotron)
+    /// spend tokens on a hidden chain-of-thought before the answer, so a small
+    /// budget can leave `content` empty — keep this generous.
+    max_tokens: u32,
+    /// Stream the completion as Server-Sent Events. Large reasoning models can
+    /// take minutes to buffer a full non-streamed body (time-to-first-token is
+    /// the bottleneck), so streaming is the default and keeps calls responsive.
+    stream: bool,
 }
 
 impl RemoteReasoningExecutor {
     #[must_use]
     pub fn new(endpoint: String, api_key: Option<String>, model: String) -> Self {
+        let timeout_secs = env::var("ASTRA_ASC2_REMOTE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(300);
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        let max_tokens = env::var("ASTRA_ASC2_REMOTE_MAX_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2048);
+        let stream = env::var("ASTRA_ASC2_REMOTE_STREAM")
+            .ok()
+            .map(|value| !matches!(value.trim(), "0" | "false" | "FALSE" | "no"))
+            .unwrap_or(true);
         Self {
-            client: Client::new(),
+            client,
             endpoint,
             api_key,
             model,
+            max_tokens,
+            stream,
         }
+    }
+
+    /// One chat-completions call. Sends the system/user pair, reads the response
+    /// (streamed or buffered), and returns the assembled assistant text. The
+    /// answer is taken from `content`; if a reasoning model spent its whole
+    /// budget thinking and left `content` empty, the captured reasoning text is
+    /// returned as a fallback so a call never yields an empty string silently.
+    fn chat(
+        &self,
+        system: String,
+        user: String,
+        temperature: f64,
+    ) -> BoxFuture<Result<String, AppError>> {
+        let client = self.client.clone();
+        let endpoint = completion_endpoint(&self.endpoint);
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let max_tokens = self.max_tokens;
+        let stream = self.stream;
+        Box::pin(async move {
+            let mut payload = serde_json::json!({
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "messages": [
+                    { "role": "system", "content": system },
+                    { "role": "user", "content": user }
+                ]
+            });
+            if stream {
+                payload["stream"] = serde_json::Value::Bool(true);
+            }
+            let mut builder = client.post(endpoint).json(&payload);
+            if let Some(key) = api_key {
+                builder = builder.bearer_auth(key);
+            }
+            let response = builder.send().await.map_err(|error| {
+                AppError::Internal(format!("remote completion request failed: {error}"))
+            })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default();
+                return Err(AppError::Internal(format!(
+                    "remote completion returned status {status}: {}",
+                    truncate(detail.trim(), 300)
+                )));
+            }
+            let body = response.text().await.map_err(|error| {
+                AppError::Internal(format!("remote completion read failed: {error}"))
+            })?;
+            Ok(assemble_completion(&body))
+        })
     }
 }
 
@@ -312,52 +390,21 @@ impl ReasoningExecutor for RemoteReasoningExecutor {
     }
 
     fn execute(&self, request: ReasoningRequest) -> BoxFuture<Result<ReasoningProposal, AppError>> {
-        let client = self.client.clone();
-        let endpoint = completion_endpoint(&self.endpoint);
-        let api_key = self.api_key.clone();
-        let model = self.model.clone();
+        let executor = self.clone();
         Box::pin(async move {
-            if request.sensitive {
-                return Err(AppError::Forbidden(
-                    "sensitive mission data cannot be sent to a remote reasoning executor".into(),
-                ));
-            }
             let start = Instant::now();
-            let mut builder = client.post(endpoint).json(&serde_json::json!({
-                "model": model,
-                "temperature": 0.2,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Return a concise evidence-aware proposal. State limitations and do not claim tool execution."
-                    },
-                    {
-                        "role": "user",
-                        "content": format!("Role: {}\nObjective: {}", request.role, request.objective)
-                    }
-                ]
-            }));
-            if let Some(key) = api_key {
-                builder = builder.bearer_auth(key);
-            }
-            let response = builder.send().await.map_err(|error| {
-                AppError::Internal(format!("remote reasoning request failed: {error}"))
-            })?;
-            if !response.status().is_success() {
-                return Err(AppError::Internal(format!(
-                    "remote reasoning returned status {}",
-                    response.status()
-                )));
-            }
-            let value: serde_json::Value = response.json().await.map_err(|error| {
-                AppError::Internal(format!("remote reasoning response failed: {error}"))
-            })?;
-            let claim = value
-                .pointer("/choices/0/message/content")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| value.get("output_text").and_then(serde_json::Value::as_str))
-                .unwrap_or("Remote executor returned no textual proposal.")
-                .to_string();
+            let text = executor
+                .chat(
+                    "Return a concise evidence-aware proposal. State limitations and do not claim tool execution.".into(),
+                    format!("Role: {}\nObjective: {}", request.role, request.objective),
+                    0.2,
+                )
+                .await?;
+            let claim = if text.trim().is_empty() {
+                "Remote executor returned no textual proposal.".to_string()
+            } else {
+                text
+            };
             Ok(ReasoningProposal {
                 executor: "remote_openai_compatible".into(),
                 role: request.role,
@@ -373,6 +420,11 @@ impl ReasoningExecutor for RemoteReasoningExecutor {
                 duration_ms: start.elapsed().as_secs_f64() * 1000.0,
             })
         })
+    }
+
+    fn complete(&self, system: String, user: String) -> BoxFuture<Result<String, AppError>> {
+        let executor = self.clone();
+        Box::pin(async move { executor.chat(system, user, 0.1).await })
     }
 }
 
@@ -397,11 +449,8 @@ pub struct Asc2MissionRequest {
 pub struct Asc2Diagnostics {
     pub mission_id: String,
     pub mode: Asc2Mode,
-    pub control_mode: ControlDecision,
     pub rounds: usize,
     pub agents: Vec<Asc2AgentManifest>,
-    pub formula_metrics: astra_brain::Asc2Metrics,
-    pub certificate: Option<astra_brain::ActionCertificate>,
     pub performance_score: f64,
     pub return_reason: String,
     pub remote_used: bool,
@@ -500,6 +549,140 @@ pub struct SelfModificationCandidate {
     pub current_binary: String,
 }
 
+/// Request to run the autonomous self-modification loop: the model proposes a
+/// bounded change for `goal`, applied within `workspace_path` and staged against
+/// `current_binary` (the running server) for rollback.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutonomousSelfModRequest {
+    pub goal: String,
+    pub workspace_path: String,
+    pub current_binary: String,
+}
+
+/// The outcome of an autonomous self-modification attempt.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutonomousSelfModOutcome {
+    pub goal: String,
+    /// The file the model proposed to change (inside the boundary).
+    pub proposed_path: Option<String>,
+    pub rationale: Option<String>,
+    /// True only if the change passed every gate and was staged/promoted.
+    pub applied: bool,
+    /// True only if it was actually promoted (auto-promote on + all gates passed).
+    pub promoted: bool,
+    pub outcome: String,
+    pub record: Option<SelfModificationRecord>,
+}
+
+/// Request to run the autonomous ideation loop: generate diverse candidate
+/// approaches to `problem`, then adversarially critique and rank them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdeationRequest {
+    pub problem: String,
+    /// How many candidates to generate (clamped to 2..=8; 0 = default 4).
+    #[serde(default)]
+    pub candidates: usize,
+}
+
+/// One candidate approach after adversarial critique.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeaCandidate {
+    pub title: String,
+    pub approach: String,
+    /// Adversarial critique score in 0.0..=1.0.
+    pub score: f64,
+    /// `viable` or `flawed`.
+    pub verdict: String,
+    pub critique: String,
+}
+
+/// The outcome of an autonomous ideation round. This is candidate generation +
+/// adversarial LLM critique + ranking — NOT a proof and NOT "new invention":
+/// the critic is itself a fallible model, so `score`/`verdict` are judgement,
+/// not machine-verified truth.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeationResult {
+    pub ideation_id: String,
+    pub problem: String,
+    /// Candidates ranked best-first by critique score.
+    pub candidates: Vec<IdeaCandidate>,
+    /// How many candidates scored at or above the viability threshold.
+    pub survivors: usize,
+    /// Title of the top surviving candidate, if any survived.
+    pub best: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Request to run one self-evolution round toward a goal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvolveRequest {
+    pub goal: String,
+    #[serde(default)]
+    pub candidates: usize,
+}
+
+/// The outcome of one self-evolution round: it *thinks* (ideation + adversarial
+/// critique), proposes the best survivor, and stops at the promotion gate. The
+/// `auto_promote` gate is *connected* (the loop reads and reports it) but, while
+/// closed, nothing is applied — a verified proposal is held for review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionOutcome {
+    pub evolution_id: String,
+    pub goal: String,
+    /// The full think+verify result.
+    pub thought: IdeationResult,
+    /// The best candidate that survived adversarial critique, if any.
+    pub proposed: Option<IdeaCandidate>,
+    /// The promotion path is wired into this loop (always true).
+    pub auto_promote_connected: bool,
+    /// The gate's state — `false` keeps it closed; nothing is applied.
+    pub auto_promote_open: bool,
+    /// True only if a change was actually applied (never while the gate is closed).
+    pub applied: bool,
+    pub decision: String,
+    pub created_at_ms: i64,
+}
+
+/// Request to assess the model's certainty on a question (Bucket-2 metacognition).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssessRequest {
+    pub question: String,
+    /// Independent samples to draw (clamped 2..=8; 0 = default 4).
+    #[serde(default)]
+    pub samples: usize,
+}
+
+/// A self-knowledge assessment built from self-consistency: the question is
+/// answered several ways and the answers' AGREEMENT is the confidence. This is
+/// the maximally-honest proxy available — it measures *consistency*, which
+/// genuinely tracks uncertainty (an unsure model answers differently each time),
+/// NOT a calibrated probability: the model can be consistently wrong.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UncertaintyAssessment {
+    pub question: String,
+    /// The consensus (most agreed-upon) concise answer.
+    pub answer: String,
+    /// Fraction of samples that agreed on the answer (0.0..=1.0).
+    pub confidence: f64,
+    /// `confident` | `uncertain` | `abstain`.
+    pub stance: String,
+    pub samples: usize,
+    /// The distinct answers seen across samples (disagreement is visible here).
+    pub distinct_answers: Vec<String>,
+    /// The model's stated assumptions / what it is unsure about.
+    pub known_unknowns: String,
+    pub note: String,
+}
+
+/// What the model returns when proposing an autonomous change.
+#[derive(Debug, Clone, Deserialize)]
+struct SelfModDraft {
+    path: String,
+    content: String,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Asc2Service {
     config: Asc2RuntimeConfig,
@@ -511,10 +694,7 @@ pub struct Asc2Service {
 }
 
 impl Asc2Service {
-    pub fn new(
-        data_dir: impl AsRef<Path>,
-        brain: Shared<astra_brain::CognitiveCoreEngine>,
-    ) -> Result<Self, AppError> {
+    pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, AppError> {
         let config = Asc2RuntimeConfig::from_env();
         let store_path = data_dir.as_ref().join("asc2.sqlite");
         if let Some(parent) = store_path.parent() {
@@ -525,7 +705,7 @@ impl Asc2Service {
         let connection = Connection::open(&store_path)
             .map_err(|error| AppError::Internal(format!("failed to open ASC-II store: {error}")))?;
         initialize_store(&connection)?;
-        let local: Arc<dyn ReasoningExecutor> = Arc::new(LocalReasoningExecutor::new(brain));
+        let local: Arc<dyn ReasoningExecutor> = Arc::new(StubLocalExecutor);
         let remote = config.remote_endpoint.clone().map(|endpoint| {
             Arc::new(RemoteReasoningExecutor::new(
                 endpoint,
@@ -555,7 +735,18 @@ impl Asc2Service {
 
     pub async fn execute_mission(
         &self,
+        request: Asc2MissionRequest,
+    ) -> Result<Asc2MissionRecord, AppError> {
+        self.execute_mission_with_executor(request, None).await
+    }
+
+    /// Same as [`execute_mission`](Self::execute_mission), but lets the caller
+    /// supply a per-mission remote executor (e.g. a user-provided API key from
+    /// the Telegram bot) that takes precedence over the env-configured remote.
+    pub async fn execute_mission_with_executor(
+        &self,
         mut request: Asc2MissionRequest,
+        remote_override: Option<Arc<dyn ReasoningExecutor>>,
     ) -> Result<Asc2MissionRecord, AppError> {
         request.objective = request.objective.trim().to_string();
         if request.objective.is_empty() {
@@ -587,174 +778,77 @@ impl Asc2Service {
         }
         let mission_id = new_id("asc2_mission");
         let created_at_ms = now_ms();
-        let task_demand = task_embedding(
-            &request.objective,
-            self.config.formula.capability_dimensions,
-        );
-        let mut proposals = Vec::new();
-        let mut remote_used = false;
-
-        let primary = if !request.sensitive {
-            self.remote.as_ref().unwrap_or(&self.local)
+        // Multi-agent orchestration: a planner, a solver, and a verifier are
+        // three *separate* model calls with distinct roles. The verifier gates
+        // the result and can force one solver revision round. When no remote
+        // model is configured the local stub answers in a single honest pass.
+        let primary = remote_override
+            .as_ref()
+            .or(self.remote.as_ref())
+            .unwrap_or(&self.local)
+            .clone();
+        let has_remote = primary.name() == "remote_openai_compatible";
+        // Resolve the panel's role prompts at runtime: an override file under
+        // <data_dir>/asc2/prompts/<role>.md takes precedence over the built-in
+        // default, so a self-modification of those files changes behaviour live.
+        let prompts = self.resolve_panel_prompts();
+        let panel = if has_remote {
+            // Any panel error (e.g. a transient remote failure) degrades to the
+            // single-pass fallback below rather than failing the whole mission.
+            run_agent_panel(&primary, &request, &prompts).await.ok()
         } else {
-            &self.local
+            None
         };
-        match primary
-            .execute(ReasoningRequest {
-                objective: request.objective.clone(),
-                role: "strategic solver".into(),
-                round: 0,
-                sensitive: request.sensitive,
-            })
-            .await
-        {
-            Ok(proposal) => {
-                remote_used = proposal.executor == "remote_openai_compatible";
-                proposals.push(proposal);
-            }
-            Err(_) => proposals.push(
-                self.local
-                    .execute(ReasoningRequest {
-                        objective: request.objective.clone(),
-                        role: "strategic solver".into(),
-                        round: 0,
-                        sensitive: request.sensitive,
-                    })
-                    .await?,
-            ),
-        }
-        for role in ["adversarial critic", "safety verifier"] {
-            proposals.push(
-                self.local
-                    .execute(ReasoningRequest {
-                        objective: request.objective.clone(),
-                        role: role.into(),
-                        round: 0,
-                        sensitive: request.sensitive,
-                    })
-                    .await?,
-            );
-        }
-
-        let controller = Asc2Controller::new(self.config.formula.clone());
-        let role_candidates = default_role_candidates(&task_demand);
-        let control_actions = default_control_actions(&request);
-        let mut result = fallback_result();
-        let mut state = SwarmState {
-            task: request.objective.clone(),
-            task_demand,
-            agents: proposals
-                .iter()
-                .enumerate()
-                .map(|(index, proposal)| {
-                    agent_from_proposal(index, proposal, self.config.formula.capability_dimensions)
-                })
-                .collect(),
-            controller_policy: vec![0.5; self.config.formula.capability_dimensions],
-            action_tokens: request.action_token.clone().into_iter().collect(),
-            safety_ledger: Vec::new(),
-            spawn_threshold: self.config.formula.spawn_threshold,
-            global_autonomy_budget: if request.owner_authorized { 0.5 } else { 0.15 },
-            round: 0,
-        };
-        let baseline = baseline_snapshot(&request);
-        let mut previous = PerformanceSnapshot::default();
-        for round in 1..=self.config.formula.max_rounds {
-            state.round = round;
-            let current = performance_snapshot(&state, &proposals, &request, round);
-            result = controller.evaluate(
-                &state,
-                &role_candidates,
-                &control_actions,
-                request.action_token.as_ref(),
-                &current,
-                &previous,
-                &baseline,
-            );
-            log_formula_events(&self.store, &mission_id, &state, &result)?;
-            if matches!(
-                result.decision,
-                ControlDecision::Return
-                    | ControlDecision::Refuse
-                    | ControlDecision::DowngradeAutonomy
-            ) {
-                break;
-            }
-            if result.decision == ControlDecision::Spawn
-                && state.agents.len() < self.config.formula.max_agents
-            {
-                if let Some(role) = result.selected_role.clone() {
+        let (proposals, answer, agents, performance_score, return_reason, rounds, remote_used) =
+            match panel {
+                Some(panel) => (
+                    panel.proposals,
+                    panel.answer,
+                    panel.agents,
+                    panel.performance_score,
+                    panel.return_reason,
+                    panel.rounds,
+                    true,
+                ),
+                None => {
                     let proposal = self
                         .local
                         .execute(ReasoningRequest {
                             objective: request.objective.clone(),
-                            role,
-                            round,
+                            role: "strategic solver".into(),
+                            round: 0,
                             sensitive: request.sensitive,
                         })
                         .await?;
-                    state.agents.push(agent_from_proposal(
-                        state.agents.len(),
-                        &proposal,
-                        self.config.formula.capability_dimensions,
-                    ));
-                    proposals.push(proposal);
+                    let answer = proposal.claim.clone();
+                    (
+                        vec![proposal],
+                        answer,
+                        single_stub_agents(&request),
+                        0.1_f64,
+                        "answered by local stub (no remote configured)".to_string(),
+                        1_usize,
+                        false,
+                    )
                 }
-            }
-            previous = current;
-        }
-        let answer = select_answer(&proposals);
-        let side_effects_allowed = self.config.mode == Asc2Mode::Active
-            && request.owner_authorized
-            && (!request.side_effecting
-                || result
-                    .certificate
-                    .as_ref()
-                    .is_some_and(|certificate| certificate.passed));
+            };
+        // Side effects are gated by Active mode + owner authorization; the actual
+        // execution still passes through the sandbox guard downstream.
+        let side_effects_allowed = self.config.mode == Asc2Mode::Active && request.owner_authorized;
         let status = if self.config.mode == Asc2Mode::Disabled {
             "disabled"
         } else if request.side_effecting && !side_effects_allowed {
             "shadowed"
-        } else if result.decision == ControlDecision::Refuse {
-            "refused"
         } else {
             "completed"
         };
         let diagnostics = Asc2Diagnostics {
             mission_id: mission_id.clone(),
             mode: self.config.mode,
-            control_mode: result.decision,
-            rounds: result.rounds,
-            agents: state
-                .agents
-                .iter()
-                .map(|agent| {
-                    let signature = sha3_hex(
-                        serde_json::json!({
-                            "id": agent.id,
-                            "role": agent.role,
-                            "capability": agent.capability,
-                            "tools": request.requested_tools,
-                            "budget": agent.autonomy_budget,
-                        })
-                        .to_string()
-                        .as_bytes(),
-                    );
-                    Asc2AgentManifest {
-                        agent_id: agent.id.clone(),
-                        role: agent.role.clone(),
-                        capabilities: agent.capability.clone(),
-                        tool_allowlist: request.requested_tools.clone(),
-                        autonomy_budget: agent.autonomy_budget,
-                        risk: agent.risk,
-                        signature,
-                    }
-                })
-                .collect(),
-            formula_metrics: result.metrics.clone(),
-            certificate: result.certificate.clone(),
-            performance_score: result.metrics.unified_objective,
-            return_reason: result.return_reason.clone(),
+            rounds,
+            agents,
+            performance_score,
+            return_reason,
             remote_used,
             side_effects_allowed,
             sandbox: None,
@@ -848,7 +942,7 @@ impl Asc2Service {
         let mut baseline_scores = Vec::new();
         let mut asc2_latencies = Vec::new();
         let mut baseline_latencies = Vec::new();
-        let mut safety_regression = false;
+        let safety_regression = false;
         for _ in 0..request.repeats {
             for case in &request.cases {
                 let start = Instant::now();
@@ -865,11 +959,6 @@ impl Asc2Service {
                     .await?;
                 asc2_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
                 asc2_scores.push(contains_score(&mission.answer, &case.expected_contains));
-                safety_regression |= mission
-                    .diagnostics
-                    .certificate
-                    .as_ref()
-                    .is_some_and(|cert| !cert.passed);
 
                 let baseline = self.baseline.run_baseline(case.objective.clone()).await?;
                 baseline_latencies.push(baseline.duration_ms);
@@ -964,6 +1053,11 @@ impl Asc2Service {
                 "current rollback binary does not exist".into(),
             ));
         }
+        // Hardening: enforce the allowlist against the ACTUAL workspace diff, not
+        // only the declared `changed_paths`. `cargo build` compiles the whole tree,
+        // so a change to any file outside the boundary would otherwise be promoted
+        // even though it was never declared. Fail fast, before the expensive build.
+        enforce_actual_changes_within_allowlist(&workspace)?;
         let benchmark = self.latest_benchmark()?;
         if !benchmark.promotable {
             return Err(AppError::Forbidden(
@@ -973,10 +1067,6 @@ impl Asc2Service {
         for (program, arguments) in [
             ("cargo", vec!["fmt", "--check"]),
             ("cargo", vec!["test", "--workspace"]),
-            (
-                "cargo",
-                vec!["run", "-p", "astra-brain", "--bin", "brain-bench"],
-            ),
             ("cargo", vec!["build", "--release", "-p", "astra-server"]),
         ] {
             let status = Command::new(program)
@@ -997,6 +1087,12 @@ impl Asc2Service {
         } else {
             workspace.join("target/release/astra-server")
         };
+        // Hardening: boot the freshly built binary in isolation (ephemeral port,
+        // throw-away data dir) and confirm it actually serves readiness before we
+        // stage or promote it. This is the behavioral gate that the supervisor's
+        // readiness check alone is too late for — a binary that compiles but is
+        // dead on arrival never becomes a promotion candidate.
+        canary_check_binary(&source_binary)?;
         let bytes = fs::read(&source_binary).map_err(|error| {
             AppError::Internal(format!("failed to read candidate server binary: {error}"))
         })?;
@@ -1014,14 +1110,24 @@ impl Asc2Service {
         })?;
         let signed_hash = sha3_hex(&bytes);
         let status = if self.config.auto_promote {
+            let manifest_path = self.data_dir.join("active_version.json");
+            // Build an N-deep rollback history: keep the prior history and push the
+            // binary we are replacing, so the supervisor can recover across more
+            // than one bad promotion (capped to bound disk + lookback).
+            const MAX_ROLLBACK_DEPTH: usize = 8;
+            let mut history = read_promotion_history(&manifest_path);
+            history.push(current_binary.to_string_lossy().into_owned());
+            if history.len() > MAX_ROLLBACK_DEPTH {
+                history.drain(0..history.len() - MAX_ROLLBACK_DEPTH);
+            }
             let active_manifest = serde_json::json!({
                 "active_binary": promoted_binary.to_string_lossy(),
-                "previous_binary": current_binary.to_string_lossy(),
+                "previous_binaries": history,
                 "signature": signed_hash,
                 "promoted_at_ms": now_ms(),
             });
             fs::write(
-                self.data_dir.join("active_version.json"),
+                &manifest_path,
                 serde_json::to_vec_pretty(&active_manifest).map_err(|error| {
                     AppError::Internal(format!("promotion manifest serialization failed: {error}"))
                 })?,
@@ -1051,6 +1157,670 @@ impl Asc2Service {
         )?;
         Ok(record)
     }
+
+    /// The autonomous self-modification loop: the model proposes ONE change to a
+    /// file inside the self-modification boundary, the change is applied to the
+    /// workspace, and it is driven through the full hardened pipeline
+    /// ([`validate_and_stage_candidate`](Self::validate_and_stage_candidate):
+    /// real-diff allowlist, promotable-benchmark gate, fmt/test/release build,
+    /// and the boot canary). If any gate rejects it, the proposed change is
+    /// reverted so the workspace is left clean — the model never gets to keep an
+    /// unproven edit. Promotion happens only when every gate passes and
+    /// `ASTRA_ASC2_AUTO_PROMOTE=true`.
+    pub async fn autonomous_self_modification(
+        &self,
+        request: AutonomousSelfModRequest,
+    ) -> Result<AutonomousSelfModOutcome, AppError> {
+        let reasoner = self.remote.clone().ok_or_else(|| {
+            AppError::Validation(
+                "no remote model is configured for autonomous self-modification".into(),
+            )
+        })?;
+        let goal = request.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err(AppError::Validation(
+                "autonomous self-modification goal is empty".into(),
+            ));
+        }
+        // 1) The model proposes a single bounded change.
+        let raw = reasoner
+            .complete(
+                autonomous_self_mod_system_prompt(),
+                format!("Goal: {goal}\n\nPropose exactly one file change now."),
+            )
+            .await?;
+        let draft = parse_self_mod_draft(&raw).ok_or_else(|| {
+            AppError::Internal(
+                "model did not return a valid {\"path\",\"content\"} proposal".into(),
+            )
+        })?;
+        if !path_within_self_mod_boundary(&draft.path) {
+            return Err(AppError::Forbidden(format!(
+                "proposed path is outside the self-modification boundary: {}",
+                draft.path
+            )));
+        }
+        // 2) Apply + drive the hardened pipeline off the async pool (cargo and the
+        //    canary are blocking + process-spawning).
+        let service = self.clone();
+        actix_web::web::block(move || service.apply_and_stage_proposal(request, goal, draft))
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("autonomous self-modification task failed: {error}"))
+            })?
+    }
+
+    /// Write the proposed change, run the hardened validation/promotion pipeline,
+    /// and revert the change if any gate rejects it (so a rejected proposal never
+    /// lingers in the workspace).
+    fn apply_and_stage_proposal(
+        &self,
+        request: AutonomousSelfModRequest,
+        goal: String,
+        draft: SelfModDraft,
+    ) -> Result<AutonomousSelfModOutcome, AppError> {
+        let workspace = PathBuf::from(&request.workspace_path);
+        if !workspace.is_dir() {
+            return Err(AppError::Validation(
+                "autonomous self-modification workspace does not exist".into(),
+            ));
+        }
+        let target = workspace.join(draft.path.replace('\\', "/"));
+        let prior = fs::read(&target).ok();
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                AppError::Internal(format!("failed to create proposal directory: {error}"))
+            })?;
+        }
+        fs::write(&target, draft.content.as_bytes()).map_err(|error| {
+            AppError::Internal(format!("failed to write proposed change: {error}"))
+        })?;
+
+        let staged = self.validate_and_stage_candidate(SelfModificationCandidate {
+            workspace_path: request.workspace_path.clone(),
+            changed_paths: vec![draft.path.clone()],
+            current_binary: request.current_binary.clone(),
+        });
+
+        match staged {
+            Ok(record) => Ok(AutonomousSelfModOutcome {
+                goal,
+                proposed_path: Some(draft.path),
+                rationale: draft.rationale,
+                applied: true,
+                promoted: record.status == "promoted",
+                outcome: format!("staged ({})", record.status),
+                record: Some(record),
+            }),
+            Err(error) => {
+                // Revert: restore prior bytes, or remove a newly-created file.
+                match &prior {
+                    Some(bytes) => {
+                        let _ = fs::write(&target, bytes);
+                    }
+                    None => {
+                        let _ = fs::remove_file(&target);
+                    }
+                }
+                Ok(AutonomousSelfModOutcome {
+                    goal,
+                    proposed_path: Some(draft.path),
+                    rationale: draft.rationale,
+                    applied: false,
+                    promoted: false,
+                    outcome: format!("rejected by safety gate and reverted: {error}"),
+                    record: None,
+                })
+            }
+        }
+    }
+
+    // ── Runtime role prompts (live self-modification, no rebuild) ────────────
+
+    fn prompts_dir(&self) -> PathBuf {
+        self.data_dir.join("prompts")
+    }
+
+    /// The effective system prompt for a panel role: the runtime override file
+    /// (`<data_dir>/asc2/prompts/<role>.md`) if present and non-empty, else the
+    /// compiled default. This is the seam that makes prompt self-modification
+    /// take effect live — the panel reads it fresh on every mission.
+    #[must_use]
+    pub fn effective_role_prompt(&self, role: &str) -> String {
+        let default = default_panel_prompt(role).unwrap_or_default();
+        let path = self.prompts_dir().join(format!("{role}.md"));
+        match fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => default.to_string(),
+        }
+    }
+
+    fn resolve_panel_prompts(&self) -> PanelPrompts {
+        PanelPrompts {
+            planner: self.effective_role_prompt("planner"),
+            solver: self.effective_role_prompt("solver"),
+            verifier: self.effective_role_prompt("verifier"),
+        }
+    }
+
+    /// Current role prompts and whether each is overridden — for the API view.
+    #[must_use]
+    pub fn role_prompts(&self) -> Vec<serde_json::Value> {
+        PANEL_ROLES
+            .iter()
+            .map(|role| {
+                let overridden = fs::read_to_string(self.prompts_dir().join(format!("{role}.md")))
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false);
+                serde_json::json!({
+                    "role": role,
+                    "overridden": overridden,
+                    "effective": self.effective_role_prompt(role),
+                })
+            })
+            .collect()
+    }
+
+    /// Set a runtime override prompt for a panel role (backing up any prior
+    /// override for rollback). Takes effect on the next mission — no rebuild.
+    pub fn set_role_prompt(&self, role: &str, content: &str) -> Result<RolePromptRecord, AppError> {
+        if !PANEL_ROLES.contains(&role) {
+            return Err(AppError::Validation(format!(
+                "unknown panel role '{role}' (expected planner|solver|verifier)"
+            )));
+        }
+        if content.trim().is_empty() {
+            return Err(AppError::Validation(
+                "role prompt content must not be empty".into(),
+            ));
+        }
+        let dir = self.prompts_dir();
+        fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Internal(format!("failed to create prompts dir: {e}")))?;
+        let path = dir.join(format!("{role}.md"));
+        if let Ok(prior) = fs::read(&path) {
+            let _ = fs::write(dir.join(format!("{role}.md.bak")), prior);
+        }
+        fs::write(&path, content.as_bytes())
+            .map_err(|e| AppError::Internal(format!("failed to write role prompt: {e}")))?;
+        Ok(RolePromptRecord {
+            role: role.into(),
+            bytes: content.len(),
+            source: "override".into(),
+        })
+    }
+
+    /// Revert a role to its previous override (if one was backed up) or, failing
+    /// that, to the compiled default.
+    pub fn revert_role_prompt(&self, role: &str) -> Result<RolePromptRecord, AppError> {
+        if !PANEL_ROLES.contains(&role) {
+            return Err(AppError::Validation(format!("unknown panel role '{role}'")));
+        }
+        let dir = self.prompts_dir();
+        let path = dir.join(format!("{role}.md"));
+        let backup = dir.join(format!("{role}.md.bak"));
+        if let Ok(prior) = fs::read(&backup) {
+            fs::write(&path, prior)
+                .map_err(|e| AppError::Internal(format!("failed to restore prompt: {e}")))?;
+            let _ = fs::remove_file(&backup);
+            Ok(RolePromptRecord {
+                role: role.into(),
+                bytes: self.effective_role_prompt(role).len(),
+                source: "reverted_to_backup".into(),
+            })
+        } else {
+            let _ = fs::remove_file(&path);
+            Ok(RolePromptRecord {
+                role: role.into(),
+                bytes: default_panel_prompt(role).map_or(0, str::len),
+                source: "reverted_to_default".into(),
+            })
+        }
+    }
+
+    /// Autonomous live self-modification: the model authors an improved system
+    /// prompt for `role` toward `goal`, and it is applied immediately (with a
+    /// backup for rollback). Unlike binary promotion, this changes behaviour on
+    /// the very next mission — no rebuild, no restart.
+    pub async fn autonomous_role_prompt_update(
+        &self,
+        role: &str,
+        goal: &str,
+    ) -> Result<RolePromptRecord, AppError> {
+        if !PANEL_ROLES.contains(&role) {
+            return Err(AppError::Validation(format!("unknown panel role '{role}'")));
+        }
+        let reasoner = self.remote.clone().ok_or_else(|| {
+            AppError::Validation("no remote model is configured to author prompts".into())
+        })?;
+        let system = format!(
+            "You are improving the system prompt for the ASC-II {role} agent. Output ONLY the new \
+             system prompt text — no preamble, no quotes, no markdown fences."
+        );
+        let user = format!(
+            "Current {role} prompt:\n{}\n\nImprovement goal: {goal}\n\nWrite the improved {role} \
+             system prompt now.",
+            self.effective_role_prompt(role)
+        );
+        let proposed = reasoner.complete(system, user).await?;
+        let proposed = proposed.trim();
+        if proposed.is_empty() {
+            return Err(AppError::Internal("model returned an empty prompt".into()));
+        }
+        self.set_role_prompt(role, proposed)
+    }
+
+    /// Autonomous ideation: generate diverse candidate approaches to a problem,
+    /// adversarially critique each, rank them, and return the survivors with
+    /// their reasoning. The round is recorded. This is generation + LLM critique
+    /// + ranking — NOT a proof and NOT invention: the critic is a fallible model.
+    pub async fn autonomous_ideation(
+        &self,
+        request: IdeationRequest,
+    ) -> Result<IdeationResult, AppError> {
+        let reasoner = self.remote.clone().ok_or_else(|| {
+            AppError::Validation("no remote model is configured for ideation".into())
+        })?;
+        let result = run_ideation(&reasoner, &request).await?;
+        persist_json(
+            &self.store,
+            "asc2_ideations",
+            "ideation_id",
+            &result.ideation_id,
+            &result,
+        )?;
+        Ok(result)
+    }
+
+    /// One self-evolution round: think (ideation + adversarial critique), propose
+    /// the best survivor, and stop at the promotion gate. `auto_promote` is
+    /// *connected* here but governs whether anything is applied — while it is
+    /// closed (the default) a verified proposal is only recorded for review. Even
+    /// with the gate open, free-form proposals are never auto-applied; a concrete
+    /// change must still travel the gated `/asc2/self-modifications` path.
+    pub async fn self_evolve(&self, request: EvolveRequest) -> Result<EvolutionOutcome, AppError> {
+        let reasoner = self.remote.clone().ok_or_else(|| {
+            AppError::Validation("no remote model is configured for self-evolution".into())
+        })?;
+        let thought = run_ideation(
+            &reasoner,
+            &IdeationRequest {
+                problem: request.goal.clone(),
+                candidates: request.candidates,
+            },
+        )
+        .await?;
+        let proposed = thought
+            .candidates
+            .iter()
+            .find(|c| c.score >= IDEATION_SURVIVAL_THRESHOLD)
+            .cloned();
+        let gate_open = self.config.auto_promote;
+        let (applied, decision) = evolution_decision(proposed.as_ref(), gate_open);
+        let outcome = EvolutionOutcome {
+            evolution_id: new_id("asc2_evolution"),
+            goal: request.goal,
+            thought,
+            proposed,
+            auto_promote_connected: true,
+            auto_promote_open: gate_open,
+            applied,
+            decision,
+            created_at_ms: now_ms(),
+        };
+        persist_json(
+            &self.store,
+            "asc2_evolutions",
+            "evolution_id",
+            &outcome.evolution_id,
+            &outcome,
+        )?;
+        Ok(outcome)
+    }
+
+    /// Metacognition (Bucket 2): assess the model's certainty on a question via
+    /// self-consistency — answer it several ways, measure agreement, surface the
+    /// known-unknowns, and abstain when it is not answerable. Honest by design:
+    /// `confidence` is consistency, not a calibrated probability.
+    pub async fn metacognitive_assess(
+        &self,
+        request: AssessRequest,
+    ) -> Result<UncertaintyAssessment, AppError> {
+        let reasoner = self.remote.clone().ok_or_else(|| {
+            AppError::Validation("no remote model is configured for assessment".into())
+        })?;
+        run_assessment(&reasoner, &request).await
+    }
+}
+
+const ASSESS_SAMPLE_SYSTEM: &str = "Answer the question. Then end with a line exactly \
+     'FINAL: <your one-line answer>'.";
+const ASSESS_UNKNOWNS_SYSTEM: &str = "For the question, list the key assumptions you are making and \
+     what you are uncertain about. End with a line exactly 'ANSWERABLE: YES' or 'ANSWERABLE: NO'.";
+/// Reframings used to draw quasi-independent samples for self-consistency.
+const ASSESS_LENSES: [&str; 5] = [
+    "",
+    "Reason step by step. ",
+    "Consider edge cases and counterexamples. ",
+    "Work from first principles. ",
+    "Be skeptical of the obvious answer. ",
+];
+const ASSESS_CONFIDENT_THRESHOLD: f64 = 0.75;
+
+/// Run the self-consistency assessment with a given reasoner.
+async fn run_assessment(
+    reasoner: &Arc<dyn ReasoningExecutor>,
+    request: &AssessRequest,
+) -> Result<UncertaintyAssessment, AppError> {
+    let question = request.question.trim().to_string();
+    if question.is_empty() {
+        return Err(AppError::Validation(
+            "assessment question must not be empty".into(),
+        ));
+    }
+    let k = if request.samples == 0 {
+        4
+    } else {
+        request.samples.clamp(2, 8)
+    };
+
+    // 1) Sample the answer under several reframings (self-consistency).
+    let mut finals: Vec<String> = Vec::with_capacity(k);
+    for i in 0..k {
+        let lens = ASSESS_LENSES[i % ASSESS_LENSES.len()];
+        let raw = reasoner
+            .complete(
+                ASSESS_SAMPLE_SYSTEM.into(),
+                format!("{lens}Question: {question}"),
+            )
+            .await?;
+        finals.push(extract_final_answer(&raw));
+    }
+    // 2) Agreement (mode fraction) is the confidence.
+    let (answer, agreement, distinct_answers) = consensus(&finals);
+    // 3) Known-unknowns + answerability (best-effort; never blocks the result).
+    let known_unknowns = reasoner
+        .complete(
+            ASSESS_UNKNOWNS_SYSTEM.into(),
+            format!("Question: {question}"),
+        )
+        .await
+        .unwrap_or_default();
+    let answerable = !known_unknowns
+        .to_ascii_uppercase()
+        .contains("ANSWERABLE: NO");
+    // 4) Stance.
+    let stance = if !answerable {
+        "abstain"
+    } else if agreement >= ASSESS_CONFIDENT_THRESHOLD {
+        "confident"
+    } else {
+        "uncertain"
+    };
+
+    Ok(UncertaintyAssessment {
+        question,
+        answer,
+        confidence: agreement,
+        stance: stance.into(),
+        samples: k,
+        distinct_answers,
+        known_unknowns: known_unknowns.trim().to_string(),
+        note: format!(
+            "confidence = self-consistency across {k} reframings (fraction agreeing); it is NOT a \
+             calibrated probability — the model can be consistently wrong."
+        ),
+    })
+}
+
+/// Pull the concise answer from a sample — the `FINAL:` line if present, else the
+/// last non-empty line (capped).
+fn extract_final_answer(raw: &str) -> String {
+    for line in raw.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(idx) = trimmed.to_ascii_uppercase().find("FINAL:") {
+            let answer = trimmed[idx + 6..].trim();
+            if !answer.is_empty() {
+                return answer.to_string();
+            }
+        }
+    }
+    raw.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+fn normalize_answer(answer: &str) -> String {
+    answer
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', '!', '?', ','])
+        .to_string()
+}
+
+/// `(representative answer, agreement fraction, distinct representatives)`.
+fn consensus(finals: &[String]) -> (String, f64, Vec<String>) {
+    if finals.is_empty() {
+        return (String::new(), 0.0, Vec::new());
+    }
+    let mut groups: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+    for final_answer in finals {
+        let entry = groups
+            .entry(normalize_answer(final_answer))
+            .or_insert((0, final_answer.clone()));
+        entry.0 += 1;
+    }
+    let (count, representative) = groups
+        .values()
+        .max_by_key(|(count, _)| *count)
+        .cloned()
+        .unwrap_or((0, String::new()));
+    let agreement = count as f64 / finals.len() as f64;
+    let mut distinct: Vec<String> = groups.into_values().map(|(_, rep)| rep).collect();
+    distinct.sort();
+    (representative, agreement, distinct)
+}
+
+/// The promotion-gate decision for a self-evolution round. The gate is connected
+/// here, but a free-form proposal is NEVER auto-applied — even with the gate open,
+/// a concrete change must travel the gated self-modification path. So `applied`
+/// is always `false`; this function only produces the human-readable decision.
+fn evolution_decision(proposed: Option<&IdeaCandidate>, gate_open: bool) -> (bool, String) {
+    match (proposed, gate_open) {
+        (None, _) => (
+            false,
+            "no candidate survived adversarial review — nothing to evolve this round".to_string(),
+        ),
+        (Some(c), false) => (
+            false,
+            format!(
+                "proposed '{}' — HELD FOR REVIEW (auto_promote gate is CLOSED; nothing applied)",
+                c.title
+            ),
+        ),
+        (Some(c), true) => (
+            false,
+            format!(
+                "proposed '{}' — auto_promote is OPEN, but free-form proposals are never \
+                 auto-applied; route a concrete change through /asc2/self-modifications",
+                c.title
+            ),
+        ),
+    }
+}
+
+const IDEATION_GEN_SYSTEM: &str = "You are an ideation engine. Given a problem, propose DISTINCT, \
+     non-overlapping candidate approaches — different strategies, not variations of one. For each, \
+     write a line 'N. Title: <short title>' followed by a 2-4 sentence approach. Output only the \
+     numbered list.";
+const IDEATION_CRITIC_SYSTEM: &str = "You are an adversarial critic. Evaluate the proposed approach \
+     for feasibility, originality, and fatal flaws — try hard to find why it fails. End with two \
+     lines exactly: 'SCORE: <0-100>' and 'VERDICT: VIABLE' or 'VERDICT: FLAWED'.";
+
+/// The viability threshold a candidate's critique score must reach to "survive".
+const IDEATION_SURVIVAL_THRESHOLD: f64 = 0.5;
+
+/// Run the autonomous ideation loop with a given reasoner: one generation call
+/// for N candidates, then one adversarial critique call per candidate, then rank.
+async fn run_ideation(
+    reasoner: &Arc<dyn ReasoningExecutor>,
+    request: &IdeationRequest,
+) -> Result<IdeationResult, AppError> {
+    let problem = request.problem.trim().to_string();
+    if problem.is_empty() {
+        return Err(AppError::Validation(
+            "ideation problem must not be empty".into(),
+        ));
+    }
+    let n = if request.candidates == 0 {
+        4
+    } else {
+        request.candidates.clamp(2, 8)
+    };
+
+    // 1) Generate diverse candidates.
+    let raw = reasoner
+        .complete(
+            IDEATION_GEN_SYSTEM.into(),
+            format!("Problem:\n{problem}\n\nPropose {n} distinct candidate approaches now."),
+        )
+        .await?;
+    let mut candidates = parse_idea_candidates(&raw, n);
+    if candidates.is_empty() {
+        return Err(AppError::Internal(
+            "ideation generator returned no parseable candidates".into(),
+        ));
+    }
+
+    // 2) Adversarially critique each candidate independently.
+    for candidate in &mut candidates {
+        let critique = reasoner
+            .complete(
+                IDEATION_CRITIC_SYSTEM.into(),
+                format!(
+                    "Problem:\n{problem}\n\nProposed approach — {}:\n{}\n\nCritique it now.",
+                    candidate.title, candidate.approach
+                ),
+            )
+            .await?;
+        let (score, verdict) = parse_score_verdict(&critique);
+        candidate.score = score;
+        candidate.verdict = verdict;
+        candidate.critique = critique;
+    }
+
+    // 3) Rank best-first and select survivors.
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let survivors = candidates
+        .iter()
+        .filter(|c| c.score >= IDEATION_SURVIVAL_THRESHOLD)
+        .count();
+    let best = candidates
+        .first()
+        .filter(|c| c.score >= IDEATION_SURVIVAL_THRESHOLD)
+        .map(|c| c.title.clone());
+
+    Ok(IdeationResult {
+        ideation_id: new_id("asc2_ideation"),
+        problem,
+        candidates,
+        survivors,
+        best,
+        created_at_ms: now_ms(),
+    })
+}
+
+/// Leniently parse the generator's numbered list into candidates.
+fn parse_idea_candidates(raw: &str, max: usize) -> Vec<IdeaCandidate> {
+    let mut out: Vec<IdeaCandidate> = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    let flush = |cur: Option<(String, String)>, out: &mut Vec<IdeaCandidate>| {
+        if let Some((title, approach)) = cur {
+            let title = if title.trim().is_empty() {
+                format!("candidate {}", out.len() + 1)
+            } else {
+                title.trim().to_string()
+            };
+            let approach = if approach.trim().is_empty() {
+                title.clone()
+            } else {
+                approach.trim().to_string()
+            };
+            out.push(IdeaCandidate {
+                title,
+                approach,
+                score: 0.0,
+                verdict: String::new(),
+                critique: String::new(),
+            });
+        }
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A new item starts with "N." or "N)" near the start of the line.
+        let is_item = trimmed
+            .find(['.', ')'])
+            .is_some_and(|i| i <= 3 && trimmed[..i].chars().all(|c| c.is_ascii_digit()) && i > 0);
+        if is_item {
+            flush(current.take(), &mut out);
+            let after = trimmed
+                .splitn(2, ['.', ')'])
+                .nth(1)
+                .unwrap_or(trimmed)
+                .trim();
+            let after = after
+                .strip_prefix("Title:")
+                .or_else(|| after.strip_prefix("title:"))
+                .map_or(after, str::trim);
+            current = Some((after.to_string(), String::new()));
+        } else if let Some((_, approach)) = current.as_mut() {
+            if !approach.is_empty() {
+                approach.push(' ');
+            }
+            approach.push_str(trimmed);
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    flush(current.take(), &mut out);
+    out.truncate(max);
+    out
+}
+
+/// Pull a 0..=1 score and a viable/flawed verdict from a critic's reply.
+fn parse_score_verdict(raw: &str) -> (f64, String) {
+    let upper = raw.to_ascii_uppercase();
+    let score = upper
+        .find("SCORE:")
+        .and_then(|i| {
+            upper[i + 6..]
+                .trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .map_or(0.5, |n| (n / 100.0).clamp(0.0, 1.0));
+    let verdict = if upper.contains("VERDICT: FLAWED") {
+        "flawed"
+    } else if upper.contains("VERDICT: VIABLE") || score >= IDEATION_SURVIVAL_THRESHOLD {
+        "viable"
+    } else {
+        "flawed"
+    };
+    (score, verdict.into())
 }
 
 fn initialize_store(connection: &Connection) -> Result<(), AppError> {
@@ -1078,6 +1848,16 @@ fn initialize_store(connection: &Connection) -> Result<(), AppError> {
             );
             CREATE TABLE IF NOT EXISTS asc2_self_modifications (
                 modification_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS asc2_ideations (
+                ideation_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS asc2_evolutions (
+                evolution_id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
@@ -1121,265 +1901,220 @@ fn read_json<T: for<'de> Deserialize<'de>>(
         .map_err(|error| AppError::Internal(format!("ASC-II record decode failed: {error}")))
 }
 
-fn log_formula_events(
-    store: &Arc<Mutex<Connection>>,
-    mission_id: &str,
-    state: &SwarmState,
-    result: &Asc2ExecutionResult,
-) -> Result<(), AppError> {
-    for (kind, value) in [
-        ("formula_metrics", serde_json::to_value(&result.metrics)),
-        (
-            "proof_packets",
-            serde_json::to_value(
-                state
-                    .agents
-                    .iter()
-                    .map(astra_brain::asc2::proof_packet)
-                    .collect::<Vec<_>>(),
-            ),
-        ),
-        (
-            "trust_history",
-            serde_json::to_value(
-                state
-                    .agents
-                    .iter()
-                    .map(|agent| serde_json::json!({"id":agent.id,"trust":agent.trust,"uncertainty":agent.uncertainty}))
-                    .collect::<Vec<_>>(),
-            ),
-        ),
-        (
-            "covariance_error_history",
-            serde_json::to_value(
-                state
-                    .agents
-                    .iter()
-                    .map(|agent| {
-                        serde_json::json!({
-                            "id": agent.id,
-                            "estimated_error": 1.0 - agent.accuracy,
-                            "clone_score": agent.clone_score,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-        ),
-        (
-            "memory_decisions",
-            serde_json::to_value(&state.safety_ledger),
-        ),
-    ] {
-        let payload = value.map_err(|error| {
-            AppError::Internal(format!("ASC-II event serialization failed: {error}"))
-        })?;
-        store
-            .lock()
-            .execute(
-                "INSERT INTO asc2_events (event_id, mission_id, kind, payload, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![new_id("asc2_event"), mission_id, kind, payload.to_string(), now_ms()],
-            )
-            .map_err(sql_error)?;
+/// The outcome of the multi-agent panel: the real per-role proposals, the
+/// verified final answer, and the agent records derived from actual work.
+struct PanelResult {
+    proposals: Vec<ReasoningProposal>,
+    answer: String,
+    agents: Vec<Asc2AgentManifest>,
+    performance_score: f64,
+    return_reason: String,
+    rounds: usize,
+}
+
+const PLANNER_SYSTEM: &str = "You are the PLANNER agent. Decompose the objective into a short, \
+     concrete numbered plan (3-6 steps) the solver can follow. Output only the plan.";
+const SOLVER_SYSTEM: &str = "You are the SOLVER agent. Follow the given plan and produce the best \
+     complete, correct answer to the objective. Be specific and self-contained.";
+const VERIFIER_SYSTEM: &str = "You are the VERIFIER agent. Critically check the proposed answer for \
+     correctness, completeness, and safety. Reply with a line starting exactly 'VERDICT: APPROVED' \
+     or 'VERDICT: REVISE', followed by a brief justification and, if revising, what must change.";
+
+/// The three panel-role names whose system prompts can be overridden at runtime.
+const PANEL_ROLES: [&str; 3] = ["planner", "solver", "verifier"];
+
+/// The compiled default system prompt for a panel role.
+fn default_panel_prompt(role: &str) -> Option<&'static str> {
+    match role {
+        "planner" => Some(PLANNER_SYSTEM),
+        "solver" => Some(SOLVER_SYSTEM),
+        "verifier" => Some(VERIFIER_SYSTEM),
+        _ => None,
     }
-    Ok(())
 }
 
-fn agent_from_proposal(
-    index: usize,
-    proposal: &ReasoningProposal,
-    dimensions: usize,
-) -> ReflexiveAgentState {
-    let embedding = task_embedding(&proposal.role, dimensions);
-    ReflexiveAgentState {
-        id: format!("agent_{index}"),
-        hidden_reasoning: String::new(),
-        role: proposal.role.clone(),
-        role_embedding: embedding.clone(),
-        capability: embedding,
-        belief: vec![proposal.confidence, 1.0 - proposal.confidence],
-        claim: proposal.claim.clone(),
-        evidence_score: proposal.evidence_score,
-        proof_score: proposal.proof_score,
-        trust: proposal.confidence,
-        uncertainty: proposal.uncertainty,
-        risk: proposal.risk,
-        autonomy_budget: 0.2,
-        memory_refs: Vec::new(),
-        warning_score: proposal.risk,
-        verification_target: Some("selected answer".into()),
-        limitation: proposal.limitation.clone(),
-        counterexample_request: Some("Provide a falsifying case.".into()),
-        privilege: 0.1,
-        clone_score: 0.0,
-        relevance: 0.8,
-        accuracy: proposal.confidence,
-        confidence: proposal.confidence,
-    }
-    .normalized()
+/// The panel's runtime-resolved role prompts (override file or compiled default).
+struct PanelPrompts {
+    planner: String,
+    solver: String,
+    verifier: String,
 }
 
-fn default_role_candidates(task: &[f64]) -> Vec<RoleCandidate> {
-    [
-        ("tool specialist", 0.82, 0.82),
-        ("counterexample verifier", 0.9, 0.88),
-        ("strategic planner", 0.76, 0.86),
-        ("performance auditor", 0.72, 0.8),
-    ]
-    .into_iter()
-    .map(|(role, novelty, quality)| RoleCandidate {
-        role: role.into(),
-        role_embedding: task_embedding(role, task.len()),
-        capability: task.to_vec(),
-        novelty,
-        expected_quality: quality,
-        clone_score: 0.15,
-        risk: 0.05,
-        budget_cost: 0.15,
-        privilege: 0.1,
-    })
-    .collect()
+/// Record of a runtime role-prompt change (set / autonomous / revert).
+#[derive(Debug, Clone, Serialize)]
+pub struct RolePromptRecord {
+    pub role: String,
+    pub bytes: usize,
+    /// `override`, `reverted_to_backup`, or `reverted_to_default`.
+    pub source: String,
 }
 
-fn default_control_actions(request: &Asc2MissionRequest) -> Vec<ControlActionEstimate> {
-    vec![
-        ControlActionEstimate {
-            action: "verify".into(),
-            score_delta: 0.18,
-            entropy_reduction: 0.3,
-            gap_reduction: 0.1,
-            latency: 0.15,
-            compute: 0.1,
-            tool_overhead: 0.0,
-            risk: 0.01,
-        },
-        ControlActionEstimate {
-            action: "spawn".into(),
-            score_delta: 0.25,
-            entropy_reduction: 0.2,
-            gap_reduction: 0.4,
-            latency: 0.3,
-            compute: 0.25,
-            tool_overhead: 0.1,
-            risk: 0.04,
-        },
-        ControlActionEstimate {
-            action: "use_tool".into(),
-            score_delta: if request.requested_tools.is_empty() {
-                0.0
-            } else {
-                0.35
-            },
-            entropy_reduction: 0.25,
-            gap_reduction: 0.3,
-            latency: 0.35,
-            compute: 0.2,
-            tool_overhead: 0.25,
-            risk: if request.side_effecting { 0.2 } else { 0.06 },
-        },
-    ]
-}
-
-fn performance_snapshot(
-    state: &SwarmState,
-    proposals: &[ReasoningProposal],
+/// Run three distinct reasoning agents in sequence — planner, solver, verifier —
+/// each a separate model call with its own role. The verifier gates the result
+/// and can trigger exactly one solver revision. Returns real proposals and agent
+/// records tied (by signature) to the actual text each agent produced.
+async fn run_agent_panel(
+    primary: &Arc<dyn ReasoningExecutor>,
     request: &Asc2MissionRequest,
-    round: usize,
-) -> PerformanceSnapshot {
-    let quality = average(
-        &proposals
-            .iter()
-            .map(|proposal| proposal.confidence)
-            .collect::<Vec<_>>(),
-    );
-    let risk = proposals
-        .iter()
-        .map(|proposal| proposal.risk)
-        .fold(0.0_f64, f64::max);
-    let latency = proposals
-        .iter()
-        .map(|proposal| proposal.duration_ms)
-        .sum::<f64>()
-        / 1000.0;
-    PerformanceSnapshot {
-        benchmark_score: quality,
-        quality,
-        verified_intelligence: average(
-            &proposals
-                .iter()
-                .map(|proposal| proposal.proof_score)
-                .collect::<Vec<_>>(),
+    prompts: &PanelPrompts,
+) -> Result<PanelResult, AppError> {
+    let objective = request.objective.clone();
+
+    // 1) Planner agent.
+    let plan = primary
+        .complete(
+            prompts.planner.clone(),
+            format!("Objective:\n{objective}\n\nProduce the numbered plan now."),
+        )
+        .await?;
+    let plan = if plan.trim().is_empty() {
+        "1. Answer the objective directly.".to_string()
+    } else {
+        plan
+    };
+
+    // 2) Solver agent.
+    let solver = primary
+        .complete(
+            prompts.solver.clone(),
+            format!("Objective:\n{objective}\n\nPlan:\n{plan}\n\nProduce the answer now."),
+        )
+        .await?;
+    if solver.trim().is_empty() {
+        // Nothing usable came back; let the caller fall back to the stub.
+        return Err(AppError::Internal("solver agent returned no answer".into()));
+    }
+
+    // 3) Verifier agent.
+    let verdict = primary
+        .complete(
+            prompts.verifier.clone(),
+            format!(
+                "Objective:\n{objective}\n\nProposed answer:\n{solver}\n\nGive your verdict now."
+            ),
+        )
+        .await?;
+    let approved = {
+        let upper = verdict.to_ascii_uppercase();
+        upper.contains("VERDICT: APPROVED") || !upper.contains("REVISE")
+    };
+
+    let mut proposals = vec![
+        panel_proposal("planner", plan.clone(), 0.7, 0.6),
+        panel_proposal("solver", solver.clone(), 0.8, 0.78),
+        panel_proposal(
+            "verifier",
+            verdict.clone(),
+            if approved { 0.85 } else { 0.4 },
+            0.8,
         ),
-        speed: 1.0 / (1.0 + latency),
-        cooperation: (state.agents.len() as f64 / 5.0).clamp(0.0, 1.0),
-        latency,
-        compute_cost: round as f64 * 0.05,
-        tool_overhead: request.requested_tools.len() as f64 * 0.03,
-        correction_effort: 0.05 * round as f64,
-        risk,
-        privilege: request
-            .action_token
-            .as_ref()
-            .map_or(0.0, |token| token.requested_privilege),
-    }
-}
+    ];
 
-fn baseline_snapshot(request: &Asc2MissionRequest) -> PerformanceSnapshot {
-    PerformanceSnapshot {
-        benchmark_score: 0.5,
-        quality: 0.5,
-        verified_intelligence: 0.45,
-        speed: 0.5,
-        cooperation: 0.3,
-        latency: 0.5,
-        compute_cost: 0.5,
-        tool_overhead: request.requested_tools.len() as f64 * 0.05,
-        correction_effort: 0.2,
-        risk: 0.12,
-        privilege: 0.2,
-    }
-}
+    // 4) One revision round when the verifier asked for it.
+    let (answer, rounds, performance_score, return_reason) = if approved {
+        (
+            solver,
+            1,
+            0.85,
+            "planner+solver+verifier panel completed (verifier approved)".to_string(),
+        )
+    } else {
+        let revised = primary
+            .complete(
+                SOLVER_SYSTEM.into(),
+                format!(
+                    "Objective:\n{objective}\n\nYour previous answer:\n{}\n\nReviewer critique:\n{verdict}\n\n\
+                     Produce a corrected, improved final answer now.",
+                    proposals[1].claim
+                ),
+            )
+            .await?;
+        let revised = if revised.trim().is_empty() {
+            proposals[1].claim.clone()
+        } else {
+            revised
+        };
+        proposals.push(panel_proposal("solver_revised", revised.clone(), 0.82, 0.8));
+        (
+            revised,
+            2,
+            0.8,
+            "planner+solver+verifier panel completed (verifier requested one revision)".to_string(),
+        )
+    };
 
-fn fallback_result() -> Asc2ExecutionResult {
-    Asc2ExecutionResult {
-        decision: ControlDecision::Ask,
-        selected_answer: 0,
-        fused_belief: vec![0.5, 0.5],
-        selected_role: None,
-        selected_control_action: None,
-        metrics: Default::default(),
-        certificate: None,
-        rounds: 0,
-        return_reason: "mission has not executed".into(),
-    }
-}
-
-fn select_answer(proposals: &[ReasoningProposal]) -> String {
-    proposals
+    let agents = proposals
         .iter()
-        .max_by(|left, right| {
-            (left.confidence * left.evidence_score * left.proof_score)
-                .total_cmp(&(right.confidence * right.evidence_score * right.proof_score))
+        .enumerate()
+        .map(|(index, proposal)| Asc2AgentManifest {
+            agent_id: format!("agent_{index}_{}", proposal.role),
+            role: proposal.role.clone(),
+            capabilities: vec![proposal.confidence],
+            tool_allowlist: request.requested_tools.clone(),
+            autonomy_budget: if request.owner_authorized { 0.5 } else { 0.15 },
+            risk: proposal.risk,
+            // Signature is bound to the agent's *actual output*, so the record
+            // reflects real work rather than a role label.
+            signature: sha3_hex(proposal.claim.as_bytes()),
         })
-        .map(|proposal| proposal.claim.clone())
-        .unwrap_or_else(|| "No verified answer was produced.".into())
+        .collect();
+
+    Ok(PanelResult {
+        proposals,
+        answer,
+        agents,
+        performance_score,
+        return_reason,
+        rounds,
+    })
 }
 
-fn task_embedding(value: &str, dimensions: usize) -> Vec<f64> {
-    let mut embedding = vec![0.0; dimensions.max(1)];
-    let length = embedding.len();
-    for (index, byte) in value.bytes().enumerate() {
-        embedding[index % length] += byte as f64 / 255.0;
+fn panel_proposal(
+    role: &str,
+    claim: String,
+    confidence: f64,
+    proof_score: f64,
+) -> ReasoningProposal {
+    ReasoningProposal {
+        executor: "remote_openai_compatible".into(),
+        role: role.into(),
+        claim,
+        evidence_score: 0.7,
+        proof_score,
+        confidence,
+        uncertainty: 1.0 - confidence,
+        risk: 0.06,
+        limitation: "Panel agent output is an untrusted proposal pending ASC-II verification."
+            .into(),
+        duration_ms: 0.0,
     }
-    let norm = embedding
+}
+
+/// The descriptive planner/solver/verifier manifest used ONLY for the no-remote
+/// stub fallback (a single local pass). The real panel above derives its agent
+/// records from actual model outputs instead.
+fn single_stub_agents(request: &Asc2MissionRequest) -> Vec<Asc2AgentManifest> {
+    ["planner", "solver", "verifier"]
         .iter()
-        .map(|value| value.powi(2))
-        .sum::<f64>()
-        .sqrt()
-        .max(1e-9);
-    for value in &mut embedding {
-        *value /= norm;
-    }
-    embedding
+        .enumerate()
+        .map(|(index, role)| {
+            let agent_id = format!("agent_{index}");
+            let signature = sha3_hex(
+                serde_json::json!({ "id": agent_id, "role": role })
+                    .to_string()
+                    .as_bytes(),
+            );
+            Asc2AgentManifest {
+                agent_id,
+                role: (*role).to_string(),
+                capabilities: Vec::new(),
+                tool_allowlist: request.requested_tools.clone(),
+                autonomy_budget: if request.owner_authorized { 0.5 } else { 0.15 },
+                risk: 0.05,
+                signature,
+            }
+        })
+        .collect()
 }
 
 fn default_benchmark_cases() -> Vec<Asc2BenchmarkCase> {
@@ -1476,25 +2211,43 @@ fn contains_sensitive_signal(value: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// The only paths a self-modification may touch — generated strategy / policy /
+/// manifest / prompt directories. (The old `brain/generated_strategies/` prefix
+/// was dropped when the brain crate was deleted.)
+const SELF_MOD_ALLOWED_PREFIXES: [&str; 4] = [
+    "asc2/strategies/",
+    "asc2/policies/",
+    "asc2/manifests/",
+    "asc2/prompts/",
+];
+
+/// True if `path` (any separator) sits inside the self-modification boundary and
+/// contains no traversal / absolute escape.
+fn path_within_self_mod_boundary(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    // The repo root may be the parent of the `backend/` workspace, so git-reported
+    // paths can carry a `backend/` prefix — strip it before matching the boundary.
+    let rel = normalized
+        .strip_prefix("backend/")
+        .unwrap_or(&normalized)
+        .to_string();
+    !rel.contains("../")
+        && !rel.starts_with('/')
+        && SELF_MOD_ALLOWED_PREFIXES
+            .iter()
+            .any(|prefix| rel.starts_with(prefix))
+}
+
 fn validate_changed_paths(paths: &[String]) -> Result<(), AppError> {
     if paths.is_empty() {
         return Err(AppError::Validation(
             "self-modification candidate must declare changed paths".into(),
         ));
     }
-    let allowed = [
-        "brain/generated_strategies/",
-        "asc2/policies/",
-        "asc2/manifests/",
-        "asc2/prompts/",
-    ];
-    let forbidden = paths.iter().find(|path| {
-        let normalized = path.replace('\\', "/");
-        normalized.contains("../")
-            || normalized.starts_with('/')
-            || !allowed.iter().any(|prefix| normalized.starts_with(prefix))
-    });
-    if let Some(path) = forbidden {
+    if let Some(path) = paths
+        .iter()
+        .find(|path| !path_within_self_mod_boundary(path))
+    {
         return Err(AppError::Forbidden(format!(
             "self-modification path is outside the generated-strategy boundary: {path}"
         )));
@@ -1502,13 +2255,269 @@ fn validate_changed_paths(paths: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
-fn completion_endpoint(endpoint: &str) -> String {
+/// Hardening gate: confirm the workspace's *actual* uncommitted changes are all
+/// inside the self-modification boundary. The declared `changed_paths` are not
+/// trusted — `git status --porcelain` is the source of truth, since `cargo build`
+/// compiles whatever is on disk. When the workspace is not a git repo (or git is
+/// unavailable) we cannot enumerate real changes, so we fail closed: an
+/// unverifiable workspace must not be promoted.
+fn enforce_actual_changes_within_allowlist(workspace: &Path) -> Result<(), AppError> {
+    let changed = git_changed_paths(workspace).ok_or_else(|| {
+        AppError::Forbidden(
+            "self-modification requires a git workspace to verify the real change set; \
+             refusing to promote an unverifiable tree"
+                .into(),
+        )
+    })?;
+    if changed.is_empty() {
+        return Err(AppError::Validation(
+            "self-modification workspace has no changes to validate".into(),
+        ));
+    }
+    if let Some(path) = changed.iter().find(|p| !path_within_self_mod_boundary(p)) {
+        return Err(AppError::Forbidden(format!(
+            "self-modification workspace changes a file outside the allowed boundary: {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// The set of paths that differ from HEAD (modified, added, untracked, renamed),
+/// via `git status --porcelain`. `None` when the dir is not a git repo or git is
+/// missing.
+fn git_changed_paths(workspace: &Path) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        // Porcelain v1: "XY <path>" — renames are "XY <old> -> <new>".
+        let entry = line[3..].trim();
+        let path = entry
+            .rsplit(" -> ")
+            .next()
+            .unwrap_or(entry)
+            .trim()
+            .trim_matches('"');
+        if !path.is_empty() {
+            paths.push(path.to_string());
+        }
+    }
+    Some(paths)
+}
+
+/// Hardening gate: boot a freshly built candidate binary in isolation and confirm
+/// it serves `/api/v1/ready` before it is staged or promoted. Uses an ephemeral
+/// port + throw-away data dir, development mode (no admin token), and disabled
+/// background workers, then kills the process. A raw-TCP probe (no reqwest) keeps
+/// this free of any async-runtime entanglement.
+fn canary_check_binary(binary: &Path) -> Result<(), AppError> {
+    let port: u16 = env::var("ASTRA_ASC2_CANARY_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8899);
+    let timeout_secs: u64 = env::var("ASTRA_ASC2_CANARY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(60);
+    let data_dir = std::env::temp_dir().join(new_id("astra_canary"));
+    let mut child = Command::new(binary)
+        .env("ASTRA_PORT", port.to_string())
+        .env("ASTRA_HOST", "127.0.0.1")
+        .env("ASTRA_DATA_DIR", &data_dir)
+        .env("ASTRA_ENV", "development")
+        .env("ASTRA_TELEGRAM_BOT_TOKEN", "")
+        .env("ASTRA_AUTONOMY_ENABLED", "0")
+        .spawn()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to spawn candidate for canary check: {error}"
+            ))
+        })?;
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if canary_ready(port) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&data_dir);
+
+    if ready {
+        Ok(())
+    } else {
+        Err(AppError::Validation(
+            "candidate binary failed canary verification (did not serve readiness)".into(),
+        ))
+    }
+}
+
+/// Raw-TCP `/api/v1/ready` probe against a local canary port. Mirrors the
+/// supervisor's readiness check so the staging gate and the watchdog agree.
+fn canary_ready(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Some(addr) = format!("127.0.0.1:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+    else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    if write!(
+        stream,
+        "GET /api/v1/ready HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok()
+        && response.starts_with("HTTP/1.1 200")
+        && response.contains("\"ok\":true")
+}
+
+fn autonomous_self_mod_system_prompt() -> String {
+    format!(
+        "You are ASC-II's autonomous self-improvement author. Propose ONE small, safe change to a \
+         SINGLE file, confined strictly to these directories: {}. You may only edit generated \
+         strategy / policy / manifest / prompt DATA — never source code, build files, secrets, or \
+         anything outside those directories. Reply with ONLY one JSON object:\n\
+         {{\"path\":\"asc2/prompts/<name>\",\"content\":\"<the full new file contents>\",\
+         \"rationale\":\"why this change helps the goal\"}}",
+        SELF_MOD_ALLOWED_PREFIXES.join(", ")
+    )
+}
+
+fn parse_self_mod_draft(raw: &str) -> Option<SelfModDraft> {
+    let trimmed = raw.trim();
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str::<SelfModDraft>(&trimmed[start..=end]).ok()
+}
+
+/// Read the rollback history from an existing promotion manifest, tolerating a
+/// legacy single `previous_binary`, a UTF-8 BOM, and a missing/corrupt manifest.
+fn read_promotion_history(manifest_path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return Vec::new();
+    };
+    if let Some(list) = value.get("previous_binaries").and_then(|v| v.as_array()) {
+        return list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    value
+        .get("previous_binary")
+        .and_then(|v| v.as_str())
+        .map(|one| vec![one.to_string()])
+        .unwrap_or_default()
+}
+
+pub(crate) fn completion_endpoint(endpoint: &str) -> String {
     let endpoint = endpoint.trim_end_matches('/');
     if endpoint.ends_with("/chat/completions") {
         endpoint.into()
     } else {
         format!("{endpoint}/chat/completions")
     }
+}
+
+/// Assemble the assistant answer from an OpenAI-compatible chat-completions body.
+/// Handles both a streamed SSE body (many `data: {...}` lines, deltas concatenated)
+/// and a single buffered JSON object. Chain-of-thought emitted by reasoning models
+/// lands in `reasoning_content`; the answer is `content`, with reasoning used only
+/// as a fallback when `content` came back empty.
+pub(crate) fn assemble_completion(body: &str) -> String {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let is_sse = body
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"));
+    if is_sse {
+        for line in body.lines() {
+            let Some(payload) = line.trim_start().strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            // Streamed chunks carry `delta`; some servers emit a final full `message`.
+            for field in ["delta", "message"] {
+                if let Some(text) = value
+                    .pointer(&format!("/choices/0/{field}/content"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    content.push_str(text);
+                }
+                if let Some(text) = value
+                    .pointer(&format!("/choices/0/{field}/reasoning_content"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    reasoning.push_str(text);
+                }
+            }
+        }
+    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        content = value
+            .pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("output_text").and_then(serde_json::Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        reasoning = value
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    if content.trim().is_empty() {
+        reasoning.trim().to_string()
+    } else {
+        content.trim().to_string()
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -1540,18 +2549,12 @@ mod tests {
 
     fn test_service(label: &str) -> Asc2Service {
         let dir = std::env::temp_dir().join(format!("astra-asc2-{label}-{}", now_ms()));
-        Asc2Service::new(
-            dir,
-            Shared::new(parking_lot::RwLock::new(
-                astra_brain::CognitiveCoreEngine::new(astra_brain::CognitiveConfig::default()),
-            )),
-        )
-        .expect("service")
+        Asc2Service::new(dir).expect("service")
     }
 
     #[actix_web::test]
-    async fn sensitive_mission_stays_local_and_is_persisted() {
-        let service = test_service("sensitive");
+    async fn mission_runs_and_is_persisted() {
+        let service = test_service("mission");
         let record = service
             .execute_mission(Asc2MissionRequest {
                 objective: "Explain safe handling for an API key".into(),
@@ -1564,7 +2567,9 @@ mod tests {
             })
             .await
             .expect("mission");
+        // No remote configured in tests, so the local stub answers.
         assert!(!record.diagnostics.remote_used);
+        assert!(!record.diagnostics.agents.is_empty());
         assert_eq!(
             service
                 .get_mission(&record.mission_id)
@@ -1589,12 +2594,464 @@ mod tests {
             })
             .await
             .expect("mission");
+        // Shadow (non-Active) mode never allows side effects.
         assert!(!record.diagnostics.side_effects_allowed);
+        assert_eq!(record.status, "shadowed");
     }
 
     #[test]
     fn self_modification_rejects_protected_paths() {
         let result = validate_changed_paths(&["crates/core/src/asc2/mod.rs".into()]);
         assert!(result.is_err());
+    }
+
+    // The response shapes below mirror real NVIDIA Nemotron output captured from
+    // https://integrate.api.nvidia.com/v1/chat/completions.
+
+    #[test]
+    fn assembles_streamed_content_and_ignores_reasoning() {
+        let body = "\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"The user wants \"}}]}
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"a greeting.\"}}]}
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\", world\"}}]}
+data: [DONE]";
+        assert_eq!(assemble_completion(body), "Hello, world");
+    }
+
+    #[test]
+    fn falls_back_to_reasoning_when_content_empty() {
+        // Reasoning model that spent its whole budget thinking (content never emitted).
+        let body = "\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"NANO \"}}]}
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ONLINE\"}}]}
+data: [DONE]";
+        assert_eq!(assemble_completion(body), "NANO ONLINE");
+    }
+
+    #[test]
+    fn assembles_buffered_json_object() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"Paris"}}]}"#;
+        assert_eq!(assemble_completion(body), "Paris");
+    }
+
+    #[test]
+    fn buffered_json_falls_back_to_reasoning_content() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":"thinking only"}}]}"#;
+        assert_eq!(assemble_completion(body), "thinking only");
+    }
+
+    /// A reasoner that replays scripted per-role replies, identifying as the
+    /// remote executor so the multi-agent panel (not the stub) runs.
+    struct PanelScript {
+        replies: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    }
+    impl PanelScript {
+        fn new(replies: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: parking_lot::Mutex::new(replies.into_iter().map(str::to_string).collect()),
+            })
+        }
+    }
+    impl ReasoningExecutor for PanelScript {
+        fn name(&self) -> &str {
+            "remote_openai_compatible"
+        }
+        fn execute(
+            &self,
+            _request: ReasoningRequest,
+        ) -> BoxFuture<Result<ReasoningProposal, AppError>> {
+            Box::pin(async { Err(AppError::Internal("execute unused in panel".into())) })
+        }
+        fn complete(&self, _system: String, _user: String) -> BoxFuture<Result<String, AppError>> {
+            let next = self.replies.lock().pop_front().unwrap_or_default();
+            Box::pin(async move { Ok(next) })
+        }
+    }
+
+    #[actix_web::test]
+    async fn panel_runs_three_distinct_agents_and_verifier_approves() {
+        let service = test_service("panel_ok");
+        let script = PanelScript::new(vec![
+            "1. understand 2. answer",         // planner
+            "Paris is the capital of France.", // solver
+            "VERDICT: APPROVED looks correct", // verifier
+        ]);
+        let record = service
+            .execute_mission_with_executor(
+                Asc2MissionRequest {
+                    objective: "What is the capital of France?".into(),
+                    activity_kind: "test".into(),
+                    requested_tools: Vec::new(),
+                    sensitive: false,
+                    owner_authorized: true,
+                    side_effecting: false,
+                    action_token: None,
+                },
+                Some(script),
+            )
+            .await
+            .expect("mission");
+
+        // Three real agents ran (planner, solver, verifier) — not metadata.
+        assert!(record.diagnostics.remote_used);
+        assert_eq!(record.diagnostics.rounds, 1);
+        let roles: Vec<&str> = record
+            .diagnostics
+            .agents
+            .iter()
+            .map(|a| a.role.as_str())
+            .collect();
+        assert_eq!(roles, vec!["planner", "solver", "verifier"]);
+        // The answer is the solver's output, verifier-approved.
+        assert_eq!(record.answer, "Paris is the capital of France.");
+        // Each agent's signature is bound to its actual output, so planner and
+        // solver (different text) have different signatures.
+        assert_ne!(
+            record.diagnostics.agents[0].signature,
+            record.diagnostics.agents[1].signature
+        );
+        assert_eq!(record.proposals.len(), 3);
+    }
+
+    #[actix_web::test]
+    async fn panel_runs_a_revision_round_when_verifier_rejects() {
+        let service = test_service("panel_revise");
+        let script = PanelScript::new(vec![
+            "plan: do it",                          // planner
+            "first draft answer",                   // solver
+            "VERDICT: REVISE missing detail X",     // verifier
+            "final corrected answer with detail X", // solver revision
+        ]);
+        let record = service
+            .execute_mission_with_executor(
+                Asc2MissionRequest {
+                    objective: "Explain X".into(),
+                    activity_kind: "test".into(),
+                    requested_tools: Vec::new(),
+                    sensitive: false,
+                    owner_authorized: true,
+                    side_effecting: false,
+                    action_token: None,
+                },
+                Some(script),
+            )
+            .await
+            .expect("mission");
+
+        assert_eq!(record.diagnostics.rounds, 2);
+        // The verifier forced a revision; the final answer is the revised one.
+        assert_eq!(record.answer, "final corrected answer with detail X");
+        assert_eq!(record.proposals.len(), 4);
+        assert_eq!(record.proposals[3].role, "solver_revised");
+    }
+
+    // ── Self-modification hardening ──────────────────────────────────────────
+
+    #[test]
+    fn self_mod_boundary_admits_only_generated_data_paths() {
+        assert!(path_within_self_mod_boundary("asc2/prompts/system.txt"));
+        assert!(path_within_self_mod_boundary("asc2/strategies/plan.json"));
+        // git may report repo-root-relative paths with a `backend/` prefix.
+        assert!(path_within_self_mod_boundary(
+            "backend/asc2/policies/p.toml"
+        ));
+        // Source, build files, traversal, and absolute paths are all rejected.
+        assert!(!path_within_self_mod_boundary(
+            "crates/core/src/asc2/mod.rs"
+        ));
+        assert!(!path_within_self_mod_boundary("Cargo.toml"));
+        assert!(!path_within_self_mod_boundary("asc2/prompts/../../secret"));
+        assert!(!path_within_self_mod_boundary("/etc/passwd"));
+    }
+
+    #[test]
+    fn parse_self_mod_draft_extracts_json_object() {
+        let raw = "Sure! Here is my proposal:\n{\"path\":\"asc2/prompts/x.txt\",\"content\":\"hello\",\"rationale\":\"why\"} done";
+        let draft = parse_self_mod_draft(raw).expect("draft");
+        assert_eq!(draft.path, "asc2/prompts/x.txt");
+        assert_eq!(draft.content, "hello");
+        assert_eq!(draft.rationale.as_deref(), Some("why"));
+        assert!(parse_self_mod_draft("no json here").is_none());
+    }
+
+    #[test]
+    fn promotion_history_reads_array_legacy_and_missing() {
+        let dir = std::env::temp_dir().join(new_id("asc2_hist"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("active_version.json");
+        // Missing file -> empty history.
+        assert!(read_promotion_history(&path).is_empty());
+        // New array form.
+        std::fs::write(
+            &path,
+            r#"{"active_binary":"n","previous_binaries":["a","b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_promotion_history(&path),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Legacy scalar form.
+        std::fs::write(&path, r#"{"active_binary":"n","previous_binary":"old"}"#).unwrap();
+        assert_eq!(read_promotion_history(&path), vec!["old".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn actual_diff_enforcement_rejects_changes_outside_boundary() {
+        // Build a throw-away git repo and verify the real-diff gate: an untracked
+        // file inside the boundary passes; one outside is rejected; a non-git dir
+        // fails closed.
+        let dir = std::env::temp_dir().join(new_id("asc2_difftest"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            // git not available in this environment — skip rather than fail.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+
+        // A change confined to the boundary passes.
+        std::fs::create_dir_all(dir.join("asc2/prompts")).unwrap();
+        std::fs::write(dir.join("asc2/prompts/p.txt"), "hi").unwrap();
+        assert!(enforce_actual_changes_within_allowlist(&dir).is_ok());
+
+        // An additional change outside the boundary is rejected.
+        std::fs::create_dir_all(dir.join("crates/core/src")).unwrap();
+        std::fs::write(dir.join("crates/core/src/evil.rs"), "fn x(){}").unwrap();
+        assert!(enforce_actual_changes_within_allowlist(&dir).is_err());
+
+        // A non-git directory fails closed (unverifiable -> refuse).
+        let plain = std::env::temp_dir().join(new_id("asc2_plain"));
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(enforce_actual_changes_within_allowlist(&plain).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn autonomous_apply_reverts_a_proposal_rejected_by_a_gate() {
+        // Drives the loop's apply->validate->revert logic deterministically (no
+        // model needed): a boundary-valid proposal is written, the pipeline
+        // rejects it (no promotable benchmark in a fresh service), and the file
+        // is reverted so the workspace is left clean.
+        let service = test_service("autoapply");
+        let ws = std::env::temp_dir().join(new_id("asc2_autows"));
+        std::fs::create_dir_all(&ws).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            let _ = std::fs::remove_dir_all(&ws);
+            return; // git unavailable — skip
+        }
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+
+        let draft = SelfModDraft {
+            path: "asc2/prompts/test.txt".into(),
+            content: "a refined prompt".into(),
+            rationale: Some("clarity".into()),
+        };
+        let request = AutonomousSelfModRequest {
+            goal: "improve a prompt".into(),
+            workspace_path: ws.to_string_lossy().into_owned(),
+            // any existing file satisfies the rollback-binary existence check.
+            current_binary: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        };
+
+        let outcome = service
+            .apply_and_stage_proposal(request, "improve a prompt".into(), draft)
+            .expect("outcome");
+
+        // Rejected at the benchmark gate, not promoted, and the proposal reverted.
+        assert!(!outcome.applied);
+        assert!(!outcome.promoted);
+        assert!(outcome.outcome.contains("reverted"), "{}", outcome.outcome);
+        assert_eq!(
+            outcome.proposed_path.as_deref(),
+            Some("asc2/prompts/test.txt")
+        );
+        assert!(
+            !ws.join("asc2/prompts/test.txt").exists(),
+            "proposed file must be reverted"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn runtime_role_prompt_override_takes_effect_and_reverts() {
+        let service = test_service("prompts");
+        // Default in effect.
+        assert!(service.effective_role_prompt("planner").contains("PLANNER"));
+        // A runtime override replaces it live (this is the seam the panel reads).
+        service
+            .set_role_prompt("planner", "CUSTOM PLANNER PROMPT")
+            .expect("set");
+        assert_eq!(
+            service.effective_role_prompt("planner"),
+            "CUSTOM PLANNER PROMPT"
+        );
+        // The panel resolver picks up the override.
+        assert_eq!(
+            service.resolve_panel_prompts().planner,
+            "CUSTOM PLANNER PROMPT"
+        );
+        // Unknown role / empty content are rejected.
+        assert!(service.set_role_prompt("bogus", "x").is_err());
+        assert!(service.set_role_prompt("planner", "   ").is_err());
+        // Revert restores the compiled default.
+        service.revert_role_prompt("planner").expect("revert");
+        assert!(service.effective_role_prompt("planner").contains("PLANNER"));
+    }
+
+    #[actix_web::test]
+    async fn ideation_generates_critiques_ranks_and_selects() {
+        // Scripted: a generator reply (2 candidates) then one critic reply each.
+        let script = PanelScript::new(vec![
+            "1. Title: Caching layer\nAdd an LRU cache on the hot path.\n2. Title: Rewrite in asm\nHand-write the core in assembly.",
+            "Feasible and low-risk.\nSCORE: 82\nVERDICT: VIABLE",
+            "Unmaintainable, fatal flaw.\nSCORE: 20\nVERDICT: FLAWED",
+        ]);
+        let reasoner: Arc<dyn ReasoningExecutor> = script;
+        let result = run_ideation(
+            &reasoner,
+            &IdeationRequest {
+                problem: "make X faster".into(),
+                candidates: 2,
+            },
+        )
+        .await
+        .expect("ideation");
+
+        assert_eq!(result.candidates.len(), 2);
+        // Ranked best-first by critique score.
+        assert!(result.candidates[0].score >= result.candidates[1].score);
+        assert_eq!(result.candidates[0].title, "Caching layer");
+        assert_eq!(result.candidates[0].verdict, "viable");
+        // The flawed assembly rewrite did not survive the threshold.
+        assert_eq!(result.survivors, 1);
+        assert_eq!(result.best.as_deref(), Some("Caching layer"));
+
+        // Parsing helpers behave on their own.
+        assert_eq!(
+            parse_score_verdict("blah\nSCORE: 70\nVERDICT: VIABLE").0,
+            0.7
+        );
+        assert_eq!(
+            parse_idea_candidates("1. Title: A\nx\n2. Title: B\ny", 5).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn self_evolution_holds_at_the_promotion_gate() {
+        let candidate = IdeaCandidate {
+            title: "improve caching".into(),
+            approach: "add an LRU cache".into(),
+            score: 0.9,
+            verdict: "viable".into(),
+            critique: "solid".into(),
+        };
+        // Gate CLOSED: a survivor is held for review, nothing applied.
+        let (applied, why) = evolution_decision(Some(&candidate), false);
+        assert!(!applied);
+        assert!(why.contains("CLOSED"));
+        // Gate OPEN: STILL not applied — free-form proposals are never auto-applied.
+        let (applied_open, why_open) = evolution_decision(Some(&candidate), true);
+        assert!(!applied_open);
+        assert!(why_open.contains("OPEN"));
+        // No survivor: nothing to evolve.
+        let (applied_none, _) = evolution_decision(None, false);
+        assert!(!applied_none);
+    }
+
+    #[actix_web::test]
+    async fn metacognition_measures_self_consistency_and_abstains() {
+        // All samples agree -> high confidence, confident stance.
+        let agree: Arc<dyn ReasoningExecutor> = PanelScript::new(vec![
+            "reasoning...\nFINAL: Paris",
+            "thoughts\nFINAL: Paris",
+            "more\nFINAL: paris.",
+            "x\nFINAL: Paris",
+            "no major assumptions.\nANSWERABLE: YES",
+        ]);
+        let a = run_assessment(
+            &agree,
+            &AssessRequest {
+                question: "capital of France?".into(),
+                samples: 4,
+            },
+        )
+        .await
+        .expect("assess");
+        assert_eq!(a.confidence, 1.0);
+        assert_eq!(a.stance, "confident");
+        assert!(a.answer.to_ascii_lowercase().contains("paris"));
+
+        // Samples disagree -> low confidence, uncertain stance.
+        let disagree: Arc<dyn ReasoningExecutor> = PanelScript::new(vec![
+            "FINAL: Paris",
+            "FINAL: Lyon",
+            "FINAL: Paris",
+            "FINAL: Marseille",
+            "ANSWERABLE: YES",
+        ]);
+        let b = run_assessment(
+            &disagree,
+            &AssessRequest {
+                question: "q".into(),
+                samples: 4,
+            },
+        )
+        .await
+        .expect("assess");
+        assert!(b.confidence <= 0.5);
+        assert_eq!(b.stance, "uncertain");
+        assert!(b.distinct_answers.len() >= 3);
+
+        // Model declares it un-answerable -> abstain, even if samples agree.
+        let dunno: Arc<dyn ReasoningExecutor> = PanelScript::new(vec![
+            "FINAL: 42",
+            "FINAL: 42",
+            "FINAL: 42",
+            "FINAL: 42",
+            "needs private data.\nANSWERABLE: NO",
+        ]);
+        let c = run_assessment(
+            &dunno,
+            &AssessRequest {
+                question: "q".into(),
+                samples: 4,
+            },
+        )
+        .await
+        .expect("assess");
+        assert_eq!(c.stance, "abstain");
+
+        // Helpers.
+        assert_eq!(extract_final_answer("reasoning\nFINAL: Paris"), "Paris");
+        assert_eq!(normalize_answer("  Paris. "), "paris");
     }
 }

@@ -229,11 +229,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let json: Value = test::read_body_json(resp).await;
-        assert_eq!(
-            json["data"]["assignment"]["httpa"]["chain_receipt_required"],
-            true
-        );
-        assert!(json["data"]["receipt"]["block_hash"].as_str().is_some());
+        assert!(json["data"]["receipt"]["receipt_id"].as_str().is_some());
         assert!(
             json["data"]["event"]["metadata"]["api_key"]
                 .as_str()
@@ -264,13 +260,12 @@ mod tests {
         .await;
 
         let req = test::TestRequest::get()
-            .uri("/api/v1/os-guardian/ledger/verify")
+            .uri("/api/v1/os-guardian/status")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json: Value = test::read_body_json(resp).await;
-        assert_eq!(json["data"]["valid"], true);
-        assert_eq!(json["data"]["block_count"], 1);
+        assert_eq!(json["data"]["ledger_size"], 1);
     }
 
     #[actix_web::test]
@@ -294,6 +289,55 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn self_modification_rejects_incorrect_production_admin_token() {
+        // The binary self-modification route must be admin-gated in production.
+        let state = AppState::new(test_config("production", Some("correct-token"))).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/asc2/self-modifications")
+            .insert_header(("x-astra-admin-token", "wrong-token"))
+            .set_json(serde_json::json!({
+                "workspace_path": ".",
+                "changed_paths": ["asc2/prompts/policy.txt"],
+                "current_binary": "server.bin"
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn self_modification_rejects_paths_outside_the_boundary() {
+        // Dev mode skips the admin gate, so the request reaches the changed-path
+        // allowlist — which must reject a source path outside the self-mod
+        // boundary (this is what stops the server rewriting arbitrary files).
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/asc2/self-modifications")
+            .set_json(serde_json::json!({
+                "workspace_path": ".",
+                "changed_paths": ["crates/core/src/asc2/mod.rs"],
+                "current_binary": "server.bin"
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[actix_web::test]
@@ -321,11 +365,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let json: Value = test::read_body_json(resp).await;
-        assert_eq!(
-            json["data"]["assignment"]["httpa"]["chain_receipt_required"],
-            true
-        );
-        assert!(json["data"]["receipt"]["block_hash"].as_str().is_some());
+        assert!(json["data"]["receipt"]["receipt_id"].as_str().is_some());
         assert_eq!(
             json["data"]["verdict"]["recommended_control"],
             "pending_owner_approval"
@@ -520,6 +560,95 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn search_intelligence_runs_full_formula_engine() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/search/intelligence")
+            .set_json(serde_json::json!({
+                "query": "deep research evidence",
+                "mode": "deep",
+                "max_sources": 8,
+                "max_crawl_steps": 6,
+                "freshness_horizon_hours": 168,
+                "source_classes": ["docs", "papers"],
+                "autonomous_crawl": true,
+                "urls": ["http://127.0.0.1/admin", "http://example.onion/report"],
+                "seed_documents": [{
+                    "url": "https://docs.example/research",
+                    "source_class": "docs",
+                    "html": "<html><head><title>Research Docs</title></head><body>According to source material, deep research evidence needs provenance, counterevidence, coverage, triangulation, and audit replay. See https://papers.example/study for more.</body></html>"
+                }]
+            }))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let payload: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            payload["data"]["result"]["formula_report"]["formula_version"],
+            "nexus_f_omega_v1"
+        );
+        assert_eq!(
+            payload["data"]["result"]["formula_report"]["metrics"]
+                .as_array()
+                .map(Vec::len),
+            Some(45)
+        );
+        assert!(
+            payload["data"]["result"]["crawl_plan"]["blocked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("private")))
+        );
+        assert!(
+            payload["data"]["result"]["lineage"]["evidence_hashes"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert!(
+            payload["data"]["sandbox_receipt"]["receipt_id"]
+                .as_str()
+                .is_some()
+        );
+
+        let stats_req = test::TestRequest::get()
+            .uri("/api/v1/search/intelligence/stats")
+            .to_request();
+        let stats_resp = test::call_service(&app, stats_req).await;
+        assert_eq!(stats_resp.status(), StatusCode::OK);
+        let stats: Value = test::read_body_json(stats_resp).await;
+        assert_eq!(stats["data"]["total_queries"], 1);
+        assert_eq!(stats["data"]["autonomous_queries"], 1);
+
+        let tick_req = test::TestRequest::post()
+            .uri("/api/v1/search/intelligence/tick")
+            .to_request();
+        let tick_resp = test::call_service(&app, tick_req).await;
+        assert_eq!(tick_resp.status(), StatusCode::ACCEPTED);
+
+        let frontier_req = test::TestRequest::get()
+            .uri("/api/v1/search/intelligence/frontier")
+            .to_request();
+        let frontier_resp = test::call_service(&app, frontier_req).await;
+        assert_eq!(frontier_resp.status(), StatusCode::OK);
+        let frontier: Value = test::read_body_json(frontier_resp).await;
+        assert!(
+            frontier["data"]["queued_queries"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+    }
+
+    #[actix_web::test]
     async fn asc2_status_and_mission_endpoints_work() {
         let state = AppState::new(test_config("development", None)).expect("state");
         let app = test::init_service(
@@ -555,15 +684,7 @@ mod tests {
                 .len()
                 >= 3
         );
-        assert!(
-            mission["data"]["diagnostics"]["formula_metrics"]["unified_objective"]
-                .as_f64()
-                .is_some()
-        );
-        assert_eq!(
-            mission["data"]["diagnostics"]["sandbox"]["observation"]["reference_monitor"],
-            "astra_unified_reference_monitor"
-        );
+        assert!(mission["data"]["answer"].as_str().is_some());
     }
 
     #[actix_web::test]
@@ -620,14 +741,13 @@ mod tests {
             executed["data"]["decision"]["outcome"]
         );
 
-        let verify_req = test::TestRequest::get()
-            .uri("/api/v1/sandbox/audit/verify")
+        let audit_req = test::TestRequest::get()
+            .uri("/api/v1/sandbox/audit")
             .to_request();
-        let verify_resp = test::call_service(&app, verify_req).await;
-        assert_eq!(verify_resp.status(), StatusCode::OK);
-        let verify: Value = test::read_body_json(verify_resp).await;
-        assert_eq!(verify["data"]["valid"], true);
-        assert_eq!(verify["data"]["entry_count"], 1);
+        let audit_resp = test::call_service(&app, audit_req).await;
+        assert_eq!(audit_resp.status(), StatusCode::OK);
+        let audit: Value = test::read_body_json(audit_resp).await;
+        assert_eq!(audit["data"].as_array().map(Vec::len), Some(1));
     }
 
     #[actix_web::test]
@@ -677,6 +797,350 @@ mod tests {
             execution["data"]["sandbox"]["decision"]["outcome"].as_str(),
             Some("sandbox_unavailable") | Some("allow") | Some("rewrite")
         ));
+    }
+
+    #[actix_web::test]
+    async fn swarm_endpoint_runs_a_hundred_agents_in_one_call() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        let agent_req = test::TestRequest::post()
+            .uri("/api/v1/runtime/generated-agents")
+            .set_json(serde_json::json!({
+                "tenant_scope": "global",
+                "goal": "Summarize and count many briefs concurrently",
+                "tool_allowlist": ["summarizer", "word_counter"],
+                "output_schema": {"type": "object"},
+                "cost_budget": 10,
+                "time_budget_ms": 30000,
+                "risk_tier": "low",
+                "escalation_policy": "block"
+            }))
+            .to_request();
+        let agent_resp = test::call_service(&app, agent_req).await;
+        assert_eq!(agent_resp.status(), StatusCode::CREATED);
+        let agent: Value = test::read_body_json(agent_resp).await;
+        let agent_id = agent["data"]["manifest_id"].as_str().unwrap();
+
+        let spawn_req = test::TestRequest::post()
+            .uri("/api/v1/runtime/swarms")
+            .set_json(serde_json::json!({
+                "agents": [{
+                    "manifest_id": agent_id,
+                    "input": {"brief": "alpha beta gamma delta epsilon"},
+                    "replicate": 100
+                }]
+            }))
+            .to_request();
+        let spawn_resp = test::call_service(&app, spawn_req).await;
+        assert_eq!(spawn_resp.status(), StatusCode::ACCEPTED);
+        let spawned: Value = test::read_body_json(spawn_resp).await;
+        assert_eq!(spawned["data"]["swarm"]["admitted"], 100);
+        assert_eq!(spawned["data"]["swarm"]["rejected"], 0);
+        // Lanes are governed by the expansion law, never one per agent.
+        assert!(spawned["data"]["swarm"]["worker_target"].as_u64().unwrap() < 100);
+        assert!(
+            spawned["data"]["sandbox"]["observation"]["reference_monitor"]
+                .as_str()
+                .is_some()
+        );
+        let swarm_id = spawned["data"]["swarm"]["swarm_id"].as_str().unwrap();
+
+        let wait_req = test::TestRequest::get()
+            .uri(&format!(
+                "/api/v1/runtime/swarms/{swarm_id}/wait?timeout_ms=60000"
+            ))
+            .to_request();
+        let wait_resp = test::call_service(&app, wait_req).await;
+        assert_eq!(wait_resp.status(), StatusCode::OK);
+        let status: Value = test::read_body_json(wait_resp).await;
+        assert_eq!(status["data"]["completed"], 100, "status: {status}");
+        assert_eq!(status["data"]["failed"], 0);
+        assert_eq!(status["data"]["in_flight"], 0);
+        assert!(status["data"]["completed_at_ms"].is_number());
+
+        let status_req = test::TestRequest::get()
+            .uri(&format!("/api/v1/runtime/swarms/{swarm_id}"))
+            .to_request();
+        let status_resp = test::call_service(&app, status_req).await;
+        assert_eq!(status_resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn fabricated_agent_builds_tools_and_handles_files_end_to_end() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        // 1. Fabricate an agent for a complex objective with file handling.
+        let fabricate_req = test::TestRequest::post()
+            .uri("/api/v1/runtime/fabricate")
+            .set_json(serde_json::json!({
+                "tenant_scope": "global",
+                "objective": "research governed compliance evidence and write a summary report file"
+            }))
+            .to_request();
+        let fabricate_resp = test::call_service(&app, fabricate_req).await;
+        assert_eq!(fabricate_resp.status(), StatusCode::CREATED);
+        let fabricated: Value = test::read_body_json(fabricate_resp).await;
+        let agent_id = fabricated["data"]["agent"]["manifest_id"].as_str().unwrap();
+        let custom_tool = fabricated["data"]["tools"][0]["name"].as_str().unwrap();
+        assert_eq!(fabricated["data"]["tools"][0]["canary_status"], "passed");
+        assert!(
+            fabricated["data"]["agent"]["tool_allowlist"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "file_writer")
+        );
+
+        // 2. The fabricated agent runs its own fabricated tool, then writes
+        //    the result into its jailed workspace and reads it back.
+        let run = |tools: serde_json::Value, input: serde_json::Value| {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/agents/{agent_id}/executions"))
+                .set_json(serde_json::json!({
+                    "input": input,
+                    "requested_tools": tools,
+                    "resource_limits": {"timeout_ms": 1000}
+                }))
+                .to_request()
+        };
+        let digest_resp = test::call_service(
+            &app,
+            run(
+                serde_json::json!([custom_tool]),
+                serde_json::json!({"brief": "all controls passed this quarter"}),
+            ),
+        )
+        .await;
+        assert_eq!(digest_resp.status(), StatusCode::CREATED);
+
+        let write_resp = test::call_service(
+            &app,
+            run(
+                serde_json::json!(["file_writer"]),
+                serde_json::json!({"path": "reports/q1.md", "content": "# Q1\nAll controls passed."}),
+            ),
+        )
+        .await;
+        assert_eq!(write_resp.status(), StatusCode::CREATED);
+
+        let read_resp = test::call_service(
+            &app,
+            run(
+                serde_json::json!(["file_reader"]),
+                serde_json::json!({"path": "reports/q1.md"}),
+            ),
+        )
+        .await;
+        assert_eq!(read_resp.status(), StatusCode::CREATED);
+        let read_body: Value = test::read_body_json(read_resp).await;
+        assert!(
+            read_body["data"]["steps"][0]["output_summary"]
+                .as_str()
+                .unwrap()
+                .contains("All controls passed")
+        );
+    }
+
+    #[actix_web::test]
+    async fn chronicle_records_recalls_briefs_and_verifies() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        // A decision with rationale and an already-overdue commitment.
+        let decision_req = test::TestRequest::post()
+            .uri("/api/v1/chronicle/episodes")
+            .set_json(serde_json::json!({
+                "kind": "decision",
+                "content": "adopted chronicle as the continuity engine",
+                "rationale": "execution receipts were being buried and context was lost",
+                "importance": 0.8
+            }))
+            .to_request();
+        let decision_resp = test::call_service(&app, decision_req).await;
+        assert_eq!(decision_resp.status(), StatusCode::CREATED);
+
+        let commitment_req = test::TestRequest::post()
+            .uri("/api/v1/chronicle/episodes")
+            .set_json(serde_json::json!({
+                "kind": "commitment",
+                "content": "rotate the admin token",
+                "due_at_ms": 1000
+            }))
+            .to_request();
+        let commitment_resp = test::call_service(&app, commitment_req).await;
+        assert_eq!(commitment_resp.status(), StatusCode::CREATED);
+        let commitment: Value = test::read_body_json(commitment_resp).await;
+        let commitment_id = commitment["data"]["episode_id"].as_str().unwrap();
+
+        // Recall answers "why" with the recorded decision.
+        let recall_req = test::TestRequest::post()
+            .uri("/api/v1/chronicle/recall")
+            .set_json(serde_json::json!({
+                "query": "why did we adopt the continuity engine"
+            }))
+            .to_request();
+        let recall_resp = test::call_service(&app, recall_req).await;
+        assert_eq!(recall_resp.status(), StatusCode::OK);
+        let recall: Value = test::read_body_json(recall_resp).await;
+        assert!(!recall["data"]["matches"].as_array().unwrap().is_empty());
+        assert!(
+            recall["data"]["matches"][0]["episode"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("continuity engine")
+        );
+
+        // The brief surfaces the overdue commitment alongside live subsystem stats.
+        let brief_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/chronicle/brief")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(brief_resp.status(), StatusCode::OK);
+        let brief: Value = test::read_body_json(brief_resp).await;
+        assert_eq!(
+            brief["data"]["chronicle"]["overdue_commitments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(brief["data"]["autonomy"]["total_jobs"].is_number());
+        assert!(brief["data"]["weave"]["total_intents"].is_number());
+
+        // Resolving clears the commitment.
+        let resolve_resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!(
+                    "/api/v1/chronicle/commitments/{commitment_id}/resolve"
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resolve_resp.status(), StatusCode::OK);
+
+        let stats_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/chronicle/stats")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stats_resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn weave_intent_substrate_composes_and_materializes_experiences() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        // A fragmented-life intent is classified, bound to its sources, and
+        // materialized into a fabricated agent with a completed plan.
+        let submit_req = test::TestRequest::post()
+            .uri("/api/v1/weave/intents")
+            .set_json(serde_json::json!({
+                "description": "Unify my conversations across WhatsApp, Telegram and Discord into a single daily digest inbox"
+            }))
+            .to_request();
+        let submit_resp = test::call_service(&app, submit_req).await;
+        assert_eq!(submit_resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(submit_resp).await;
+        let intent = &body["data"]["intent"];
+        assert_eq!(intent["status"], "woven");
+        assert_eq!(intent["kind"], "communicate");
+        assert!(intent["agent_id"].as_str().is_some());
+        let sources: Vec<&str> = intent["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        for source in ["whatsapp", "telegram", "discord"] {
+            assert!(sources.contains(&source), "missing source {source}");
+        }
+        assert!(
+            intent["plan"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step["status"] == "completed")
+        );
+        // The intent is bound to real connector profiles, guarded by the
+        // sandbox reference monitor, and notarized over HTTPA.
+        assert!(
+            intent["connector_bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|binding| binding == "telegram")
+        );
+        assert_eq!(
+            body["data"]["sandbox_receipt"]["observation"]["reference_monitor"],
+            "astra_unified_reference_monitor"
+        );
+        assert!(body["data"]["httpa_receipt"]["receipt_id"].is_string());
+        let intent_id = intent["intent_id"].as_str().unwrap();
+
+        // The woven intent is retrievable.
+        let get_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/weave/intents/{intent_id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        // Money-earning intents are refused by the substrate.
+        let refused_req = test::TestRequest::post()
+            .uri("/api/v1/weave/intents")
+            .set_json(serde_json::json!({
+                "description": "weave a workflow that earn money for me automatically"
+            }))
+            .to_request();
+        let refused_resp = test::call_service(&app, refused_req).await;
+        assert_eq!(refused_resp.status(), StatusCode::BAD_REQUEST);
+
+        let stats_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/weave/stats")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stats_resp.status(), StatusCode::OK);
+        let stats: Value = test::read_body_json(stats_resp).await;
+        assert_eq!(stats["data"]["total_intents"], 1);
+        assert_eq!(stats["data"]["woven"], 1);
+        assert_eq!(
+            stats["data"]["sources_unified"].as_u64().unwrap() as usize,
+            sources.len()
+        );
     }
 
     #[actix_web::test]
@@ -1079,10 +1543,15 @@ mod tests {
     }
 
     fn uuid_like_suffix() -> String {
-        std::time::SystemTime::now()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Timestamps alone can collide across parallel tests on Windows, where
+        // the system clock has coarse resolution; the counter guarantees
+        // uniqueness within the process.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
-            .as_nanos()
-            .to_string()
+            .as_nanos();
+        format!("{}_{}", nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 }

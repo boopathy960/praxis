@@ -18,6 +18,10 @@ backend/target/
 !.env.example
 *.log
 
+# Runtime data stores (SQLite, workspaces) created under ASTRA_DATA_DIR
+backend/data/
+backend/crates/server/data/
+
 # OS generated files
 Thumbs.db
 db.json

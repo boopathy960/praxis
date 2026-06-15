@@ -1,9 +1,15 @@
-use actix_web::{HttpResponse, web};
+use actix_web::{HttpRequest, HttpResponse, http::header, web};
 use astra_core::{
     AppState,
-    asc2::{Asc2BenchmarkRequest, Asc2MissionRequest},
+    asc2::{
+        Asc2BenchmarkRequest, Asc2MissionRequest, AssessRequest, AutonomousSelfModRequest,
+        EvolveRequest, IdeationRequest, SelfModificationCandidate,
+    },
     common::{ApiResponse, AppError},
 };
+use serde::Deserialize;
+
+const HEADER_ADMIN_TOKEN: &str = "x-astra-admin-token";
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/asc2/missions", web::post().to(create_mission))
@@ -14,7 +20,26 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route(
             "/asc2/self-modifications",
             web::get().to(list_self_modifications),
-        );
+        )
+        .route(
+            "/asc2/self-modifications",
+            web::post().to(stage_self_modification),
+        )
+        .route(
+            "/asc2/self-modifications/autonomous",
+            web::post().to(autonomous_self_modification),
+        )
+        // Runtime role prompts — live self-modification with no rebuild.
+        .route("/asc2/prompts", web::get().to(list_role_prompts))
+        .route("/asc2/prompts", web::post().to(set_role_prompt))
+        .route(
+            "/asc2/prompts/autonomous",
+            web::post().to(autonomous_role_prompt),
+        )
+        .route("/asc2/prompts/revert", web::post().to(revert_role_prompt))
+        .route("/asc2/ideate", web::post().to(ideate))
+        .route("/asc2/evolve", web::post().to(evolve))
+        .route("/asc2/assess", web::post().to(assess));
 }
 
 async fn create_mission(
@@ -38,6 +63,18 @@ async fn create_mission(
     let sandbox = state
         .sandbox
         .guard(sandbox_action, request.side_effecting)?;
+    super::remember(
+        &state,
+        astra_core::chronicle::EpisodeKind::Event,
+        format!(
+            "asc2 mission '{}' executed for activity '{}'",
+            request.objective, request.activity_kind
+        ),
+        "asc2",
+        Some(mission.mission_id.clone()),
+        vec!["asc2".into()],
+        0.5,
+    );
     Ok(HttpResponse::Accepted().json(ApiResponse::ok(
         state.asc2.attach_sandbox(&mission.mission_id, sandbox)?,
     )))
@@ -69,4 +106,173 @@ async fn latest_benchmark(state: web::Data<AppState>) -> Result<HttpResponse, Ap
 
 async fn list_self_modifications(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(ApiResponse::ok(state.asc2.self_modifications()?)))
+}
+
+/// Validate and stage a candidate self-modification: the server formats, tests,
+/// and **release-builds** the candidate workspace, then stages (and, when
+/// `ASTRA_ASC2_AUTO_PROMOTE=true`, promotes) the resulting binary for the
+/// rollback supervisor to pick up. This is the binary self-modification entry
+/// point — it spawns `cargo` and can swap the running binary, so it is:
+///   * **admin-gated** (production requires `x-astra-admin-token`), and
+///   * gated again inside the service by a *promotable* benchmark, a changed-path
+///     allowlist, and existence checks on the workspace + rollback binary.
+/// Body: `{ "workspace_path": "...", "changed_paths": ["asc2/prompts/..."], "current_binary": "..." }`.
+async fn stage_self_modification(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<SelfModificationCandidate>,
+) -> Result<HttpResponse, AppError> {
+    authorize_admin(&state, &request)?;
+    let candidate = body.into_inner();
+    let asc2 = state.asc2.clone();
+    // fmt/test/`build --release` is heavy and spawns processes — keep it off the
+    // async worker pool.
+    let record = web::block(move || asc2.validate_and_stage_candidate(candidate))
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("self-modification staging task failed: {error}"))
+        })??;
+    Ok(HttpResponse::Accepted().json(ApiResponse::ok(record)))
+}
+
+/// Run the autonomous self-modification loop: the model proposes one bounded
+/// change, it's applied + driven through the full hardened pipeline, and reverted
+/// if any gate rejects it. Admin-gated. Body:
+/// `{ "goal": "...", "workspace_path": "...", "current_binary": "..." }`.
+async fn autonomous_self_modification(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<AutonomousSelfModRequest>,
+) -> Result<HttpResponse, AppError> {
+    authorize_admin(&state, &request)?;
+    let outcome = state
+        .asc2
+        .autonomous_self_modification(body.into_inner())
+        .await?;
+    Ok(HttpResponse::Accepted().json(ApiResponse::ok(outcome)))
+}
+
+/// Autonomous ideation: generate diverse candidate approaches to a problem,
+/// critique each adversarially, and return them ranked with the survivors.
+/// Body: `{ "problem": "...", "candidates": 4 }`.
+async fn ideate(
+    state: web::Data<AppState>,
+    body: web::Json<IdeationRequest>,
+) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(
+        state.asc2.autonomous_ideation(body.into_inner()).await?,
+    )))
+}
+
+/// One self-evolution round: think (ideation + adversarial critique) toward a
+/// goal, propose the best survivor, and stop at the promotion gate. The
+/// `auto_promote` gate is connected but stays closed — nothing is applied.
+/// Body: `{ "goal": "...", "candidates": 4 }`.
+async fn evolve(
+    state: web::Data<AppState>,
+    body: web::Json<EvolveRequest>,
+) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(
+        state.asc2.self_evolve(body.into_inner()).await?,
+    )))
+}
+
+/// Metacognition: assess the model's certainty on a question via self-consistency
+/// (answer it several ways, measure agreement, abstain if not answerable).
+/// Body: `{ "question": "...", "samples": 4 }`.
+async fn assess(
+    state: web::Data<AppState>,
+    body: web::Json<AssessRequest>,
+) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(
+        state.asc2.metacognitive_assess(body.into_inner()).await?,
+    )))
+}
+
+/// The current panel role prompts (planner/solver/verifier) and whether each is
+/// overridden by a runtime file. Read-only.
+async fn list_role_prompts(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(state.asc2.role_prompts())))
+}
+
+#[derive(Deserialize)]
+struct SetPromptBody {
+    role: String,
+    content: String,
+}
+
+/// Set a runtime override prompt for a panel role (admin-gated). Takes effect on
+/// the next mission — no rebuild. Body: `{ "role": "planner", "content": "..." }`.
+async fn set_role_prompt(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<SetPromptBody>,
+) -> Result<HttpResponse, AppError> {
+    authorize_admin(&state, &request)?;
+    let body = body.into_inner();
+    let record = state.asc2.set_role_prompt(&body.role, &body.content)?;
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(record)))
+}
+
+#[derive(Deserialize)]
+struct AutoPromptBody {
+    role: String,
+    goal: String,
+}
+
+/// Autonomous live self-modification (admin-gated): the model authors an improved
+/// system prompt for a panel role and it is applied immediately, with a backup
+/// kept for rollback. Body: `{ "role": "planner", "goal": "..." }`.
+async fn autonomous_role_prompt(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<AutoPromptBody>,
+) -> Result<HttpResponse, AppError> {
+    authorize_admin(&state, &request)?;
+    let body = body.into_inner();
+    let record = state
+        .asc2
+        .autonomous_role_prompt_update(&body.role, &body.goal)
+        .await?;
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(record)))
+}
+
+#[derive(Deserialize)]
+struct RevertPromptBody {
+    role: String,
+}
+
+/// Revert a role prompt to its prior override or the compiled default (admin-gated).
+async fn revert_role_prompt(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    body: web::Json<RevertPromptBody>,
+) -> Result<HttpResponse, AppError> {
+    authorize_admin(&state, &request)?;
+    let record = state.asc2.revert_role_prompt(&body.into_inner().role)?;
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(record)))
+}
+
+/// Admin gate for state-changing privileged routes: open in development, and in
+/// production requires a constant-time match of the `x-astra-admin-token` header
+/// against the configured token. Mirrors `os_guardian::authorize_guardian_write`.
+fn authorize_admin(state: &web::Data<AppState>, request: &HttpRequest) -> Result<(), AppError> {
+    if state.config.is_development() {
+        return Ok(());
+    }
+    let configured = state
+        .config
+        .admin_token
+        .as_deref()
+        .ok_or(AppError::Unauthorized)?;
+    let provided = request
+        .headers()
+        .get(header::HeaderName::from_static(HEADER_ADMIN_TOKEN))
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    if astra_core::common::constant_time_token_eq(provided, configured) {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
+    }
 }

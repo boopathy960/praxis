@@ -13,7 +13,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/os-guardian/status", web::get().to(status))
         .route("/os-guardian/events", web::post().to(submit_event))
         .route("/os-guardian/events", web::get().to(recent_events))
-        .route("/os-guardian/ledger/verify", web::get().to(verify_ledger))
         .route("/os-guardian/dlp/analyze", web::post().to(analyze_dlp))
         .route("/os-guardian/dlp/policy", web::get().to(dlp_policy))
         .route("/os-guardian/dlp/decoys", web::get().to(dlp_decoys))
@@ -92,6 +91,18 @@ async fn submit_event(
             "orchestration": orchestration,
         }),
     )?;
+    super::remember(
+        &state,
+        astra_core::chronicle::EpisodeKind::Event,
+        format!(
+            "os-guardian event '{}' evaluated at severity {:?}",
+            event.event.subject, event.evaluation.severity
+        ),
+        "os_guardian",
+        Some(event.event.event_id.clone()),
+        vec!["security".into()],
+        importance_for_severity(event.evaluation.severity),
+    );
     let mut value = serde_json::to_value(event).map_err(|error| {
         AppError::Internal(format!("guardian response serialization failed: {error}"))
     })?;
@@ -109,10 +120,6 @@ async fn submit_event(
 
 async fn recent_events(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(ApiResponse::ok(state.os_guardian.recent_events())))
-}
-
-async fn verify_ledger(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(ApiResponse::ok(state.os_guardian.verify_ledger())))
 }
 
 async fn analyze_dlp(
@@ -184,6 +191,18 @@ async fn analyze_dlp(
             "orchestration": orchestration,
         }),
     )?;
+    super::remember(
+        &state,
+        astra_core::chronicle::EpisodeKind::Event,
+        format!(
+            "dlp analysis of '{}' returned severity {:?}",
+            analysis.signal.subject, analysis.verdict.severity
+        ),
+        "os_guardian",
+        Some(analysis.signal.signal_id.clone()),
+        vec!["security".into(), "dlp".into()],
+        importance_for_severity(analysis.verdict.severity),
+    );
     let mut value = serde_json::to_value(analysis).map_err(|error| {
         AppError::Internal(format!("DLP response serialization failed: {error}"))
     })?;
@@ -230,10 +249,19 @@ fn authorize_guardian_write(
         .and_then(|value| value.to_str().ok())
         .ok_or(AppError::Unauthorized)?;
 
-    if provided == configured {
+    if astra_core::common::constant_time_token_eq(provided, configured) {
         Ok(())
     } else {
         Err(AppError::Unauthorized)
+    }
+}
+
+fn importance_for_severity(severity: GuardianSeverity) -> f64 {
+    match severity {
+        GuardianSeverity::Informational | GuardianSeverity::Low => 0.4,
+        GuardianSeverity::Moderate => 0.6,
+        GuardianSeverity::High => 0.8,
+        GuardianSeverity::Critical => 0.9,
     }
 }
 

@@ -24,4 +24,3 @@ thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-astra-brain = { path = "../../brain" }

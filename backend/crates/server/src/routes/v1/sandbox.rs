@@ -15,7 +15,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/sandbox/actions/evaluate", web::post().to(evaluate_action))
         .route("/sandbox/actions/execute", web::post().to(execute_action))
         .route("/sandbox/audit", web::get().to(audit))
-        .route("/sandbox/audit/verify", web::get().to(verify_audit));
+        .route("/sandbox/threats", web::get().to(threats));
 }
 
 async fn status(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
@@ -53,6 +53,8 @@ async fn audit(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(ApiResponse::ok(state.sandbox.audit(200)?)))
 }
 
-async fn verify_audit(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(ApiResponse::ok(state.sandbox.verify_audit()?)))
+/// The intrusion threat-intel feed: every breakout / honeypot-decoy attempt the
+/// perimeter caught, newest first — for the governance layer to review.
+async fn threats(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(state.sandbox.threat_events(200)?)))
 }

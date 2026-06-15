@@ -187,6 +187,23 @@ impl ResponseError for AppError {
     }
 }
 
+/// Runs a blocking task (e.g. `reqwest::blocking` HTTP exchange) on a dedicated
+/// OS thread so its internal tokio runtime is never created or dropped inside an
+/// async runtime context, which would panic with "Cannot drop a runtime in a
+/// context where blocking is not allowed".
+pub fn run_blocking_io<T, F>(task: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("astra-blocking-io".into())
+        .spawn(task)
+        .map_err(|error| AppError::Internal(format!("failed to spawn blocking io thread: {error}")))?
+        .join()
+        .map_err(|_| AppError::Internal("blocking io thread panicked".into()))?
+}
+
 #[must_use]
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -216,6 +233,20 @@ pub fn sha3_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha3_256::new();
     hasher.update(input.as_ref());
     hex::encode(hasher.finalize())
+}
+
+/// Compares a provided secret against the expected one without leaking the
+/// match position or the secret length through timing. Both sides are hashed
+/// to a fixed width, then folded with XOR.
+#[must_use]
+pub fn constant_time_token_eq(provided: &str, expected: &str) -> bool {
+    let provided = Sha3_256::digest(provided.as_bytes());
+    let expected = Sha3_256::digest(expected.as_bytes());
+    provided
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 #[must_use]

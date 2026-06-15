@@ -1,5 +1,5 @@
 [workspace]
-members = ["brain", "crates/core", "crates/server", "crates/supervisor"]
+members = ["crates/core", "crates/server", "crates/supervisor"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ actix-web = "4.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 hex = "0.4"
 log = "0.4"
+nalgebra = "0.33"
 ndarray = "0.16"
 parking_lot = "0.12"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

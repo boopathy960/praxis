@@ -366,12 +366,14 @@ async fn run_agent(
 ) -> Result<HttpResponse, AppError> {
     let (organization_id, agent_key) = path.into_inner();
     let agent = AgentKind::from_key(&agent_key)?;
-    let run = state.nexus.run_agent(
-        &principal(&request, &state)?,
-        &organization_id,
-        agent,
-        body.into_inner(),
-    )?;
+    // Agent runs may perform live monitored fetches; keep them off async workers.
+    let principal = principal(&request, &state)?;
+    let nexus = state.nexus.clone();
+    let run_request = body.into_inner();
+    let blocking_org = organization_id.clone();
+    let run = web::block(move || nexus.run_agent(&principal, &blocking_org, agent, run_request))
+        .await
+        .map_err(|error| AppError::Internal(format!("nexus agent run failed: {error}")))??;
     let run = attach_reasoning(&state, &organization_id, agent, run).await?;
     Ok(HttpResponse::Accepted().json(ApiResponse::ok(run)))
 }
@@ -473,14 +475,31 @@ async fn ingest_event(
     organization_id: web::Path<String>,
     body: web::Json<IngestBusinessEventRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let mut result = state.nexus.ingest_event(
-        &principal(&request, &state)?,
-        &organization_id,
-        body.into_inner(),
-    )?;
+    // Event ingestion may fetch and semantically render a website_url; keep it
+    // off async workers.
+    let principal = principal(&request, &state)?;
+    let nexus = state.nexus.clone();
+    let event_request = body.into_inner();
+    let blocking_org = organization_id.clone();
+    let mut result =
+        web::block(move || nexus.ingest_event(&principal, &blocking_org, event_request))
+            .await
+            .map_err(|error| AppError::Internal(format!("nexus event ingestion failed: {error}")))??;
     for run in &mut result.triggered_runs {
         *run = attach_reasoning(&state, &organization_id, run.agent, run.clone()).await?;
     }
+    super::remember(
+        &state,
+        astra_core::chronicle::EpisodeKind::Event,
+        format!(
+            "nexus event ingested for organization {organization_id}: {} agent runs triggered",
+            result.triggered_runs.len()
+        ),
+        "nexus",
+        Some(organization_id.to_string()),
+        vec!["nexus".into()],
+        0.5,
+    );
     Ok(HttpResponse::Accepted().json(ApiResponse::ok(result)))
 }
 
@@ -605,7 +624,7 @@ fn principal(request: &HttpRequest, state: &AppState) -> Result<String, AppError
             .get("x-astra-admin-token")
             .and_then(|value| value.to_str().ok())
             .ok_or(AppError::Unauthorized)?;
-        if provided != configured {
+        if !astra_core::common::constant_time_token_eq(provided, configured) {
             return Err(AppError::Unauthorized);
         }
     }
