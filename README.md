@@ -1,6 +1,6 @@
-# Astra — a self-hostable, auditable personal AI agent backend
+# PRAXIS — a self-hostable, auditable personal AI agent backend
 
-Astra is a security-focused personal-AI backend in Rust. You point it at your own LLM
+praxis is a security-focused personal-AI backend in Rust. You point it at your own LLM
 (any OpenAI-compatible endpoint — local Ollama or a cloud key), and it gives agents **real,
 supervised hands on your machine and the web**, executes work through a **verified agentic
 loop** (every mutating action must prove a machine-checkable postcondition), and accumulates
