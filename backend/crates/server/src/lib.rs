@@ -433,7 +433,7 @@ mod tests {
             .set_json(serde_json::json!({
                 "device_id": "owner-desktop",
                 "device_capabilities": ["windows"],
-                "action_allowlist": ["research"]
+                "action_allowlist": ["semantic_render"]
             }))
             .to_request();
         let session_resp = test::call_service(&app, session_req).await;
@@ -456,6 +456,7 @@ mod tests {
         assert_eq!(intent_resp.status(), StatusCode::ACCEPTED);
         let intent_json: Value = test::read_body_json(intent_resp).await;
         assert_eq!(intent_json["data"]["status"], "blocked");
+        assert!(intent_json["data"]["blocked_reason"].as_str().is_some());
         let receipt_id = intent_json["data"]["receipt_id"].as_str().unwrap();
 
         let receipt_req = test::TestRequest::get()
@@ -714,8 +715,7 @@ mod tests {
             .uri("/api/v1/sandbox/actions/execute")
             .set_json(serde_json::json!({
                 "action_id": "",
-                "kind": "shell_execution",
-                "command": "echo ok",
+                "kind": "unknown",
                 "resource_limits": {
                     "timeout_ms": 1000,
                     "max_output_bytes": 1024,
@@ -735,7 +735,7 @@ mod tests {
         assert!(
             matches!(
                 executed["data"]["decision"]["outcome"].as_str(),
-                Some("sandbox_unavailable") | Some("deny")
+                Some("deny")
             ),
             "unexpected sandbox outcome: {}",
             executed["data"]["decision"]["outcome"]
@@ -1511,12 +1511,244 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn eval_learning_curriculum_and_experiment_endpoints_work() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        let suite_req = test::TestRequest::post()
+            .uri("/api/v1/evals/suites")
+            .set_json(serde_json::json!({
+                "name": "contract smoke",
+                "cases": [{
+                    "name": "trivial pass",
+                    "check": {"type":"trivial", "pass": true}
+                }]
+            }))
+            .to_request();
+        let suite_resp = test::call_service(&app, suite_req).await;
+        assert_eq!(suite_resp.status(), StatusCode::OK);
+        let suite: Value = test::read_body_json(suite_resp).await;
+        let suite_id = suite["data"]["suite_id"].as_str().unwrap();
+
+        let run_req = test::TestRequest::post()
+            .uri(&format!("/api/v1/evals/suites/{suite_id}/run"))
+            .set_json(serde_json::json!({}))
+            .to_request();
+        let run_resp = test::call_service(&app, run_req).await;
+        assert_eq!(run_resp.status(), StatusCode::OK);
+        let run: Value = test::read_body_json(run_resp).await;
+        assert_eq!(run["data"]["pass"], true);
+        assert_eq!(run["data"]["passed"], 1);
+
+        let attach_req = test::TestRequest::post()
+            .uri(&format!("/api/v1/evals/suites/{suite_id}/attach"))
+            .set_json(serde_json::json!({
+                "target_kind": "forge_tool",
+                "target_id": "demo_tool"
+            }))
+            .to_request();
+        let attach_resp = test::call_service(&app, attach_req).await;
+        assert_eq!(attach_resp.status(), StatusCode::OK);
+
+        let learn_req = test::TestRequest::post()
+            .uri("/api/v1/learning/episodes")
+            .set_json(serde_json::json!({
+                "organ": "evals",
+                "signal": "failure",
+                "summary": "a calibration failure worth investigating",
+                "score": 0.2
+            }))
+            .to_request();
+        let learn_resp = test::call_service(&app, learn_req).await;
+        assert_eq!(learn_resp.status(), StatusCode::OK);
+
+        let curriculum_req = test::TestRequest::post()
+            .uri("/api/v1/curriculum/next")
+            .set_json(serde_json::json!({"limit": 5}))
+            .to_request();
+        let curriculum_resp = test::call_service(&app, curriculum_req).await;
+        assert_eq!(curriculum_resp.status(), StatusCode::OK);
+        let curriculum: Value = test::read_body_json(curriculum_resp).await;
+        assert!(!curriculum["data"]["tasks"].as_array().unwrap().is_empty());
+
+        let experiment_req = test::TestRequest::post()
+            .uri("/api/v1/experiments")
+            .set_json(serde_json::json!({
+                "idea": "prove a trivial software invariant",
+                "hypothesis": "the trivial invariant holds",
+                "contract": {
+                    "checks": [{"type":"trivial", "pass": true}]
+                },
+                "mint_claim": false
+            }))
+            .to_request();
+        let experiment_resp = test::call_service(&app, experiment_req).await;
+        assert_eq!(experiment_resp.status(), StatusCode::OK);
+        let experiment: Value = test::read_body_json(experiment_resp).await;
+        assert_eq!(experiment["data"]["experiment"]["status"], "verified");
+    }
+
+    #[actix_web::test]
     async fn production_config_requires_admin_token() {
         let error = match AppState::new(test_config("production", None)) {
             Ok(_) => panic!("production token should be required"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("ASTRA_ADMIN_TOKEN"));
+    }
+
+    #[actix_web::test]
+    async fn genome_os_seeds_commons_runs_gates_and_forks() {
+        let state = AppState::new(test_config("development", None)).expect("state");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(app_config),
+        )
+        .await;
+
+        // The console is served at the root, embedded in the binary.
+        let console =
+            test::call_service(&app, test::TestRequest::get().uri("/console").to_request()).await;
+        assert_eq!(console.status(), StatusCode::OK);
+
+        // The billing beachhead is seeded and certified on first boot.
+        let overview_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/genome/overview")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(overview_resp.status(), StatusCode::OK);
+        let overview: Value = test::read_body_json(overview_resp).await;
+        assert_eq!(overview["data"]["total_genomes"], 4);
+        assert!(
+            overview["data"]["minted"].as_u64().unwrap()
+                + overview["data"]["certified"].as_u64().unwrap()
+                >= 4
+        );
+
+        // Find the invoice genome.
+        let list_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/genome/genomes")
+                .to_request(),
+        )
+        .await;
+        let genomes: Value = test::read_body_json(list_resp).await;
+        let invoice = genomes["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["operation"] == "billing.invoice")
+            .expect("invoice genome");
+        let invoice_id = invoice["genome_id"].as_str().unwrap();
+
+        // A safe operation executes and meters its outcome.
+        let safe = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/genome/genomes/{invoice_id}/run"))
+                .set_json(serde_json::json!({
+                    "inputs": {
+                        "amount": {"kind":"money","value":800.0},
+                        "contract_value": {"kind":"money","value":1000.0},
+                        "customer_active": {"kind":"flag","value":true},
+                        "discount_pct": {"kind":"money","value":5.0}
+                    },
+                    "judgment": 800.0,
+                    "outcome_value": 800.0
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(safe.status(), StatusCode::ACCEPTED);
+        let safe_body: Value = test::read_body_json(safe).await;
+        assert_eq!(safe_body["data"]["status"], "executed");
+        assert!(safe_body["data"]["admitted"].as_bool().unwrap());
+
+        // An operation that would breach money-conservation is blocked by the
+        // envelope gate before executing — do no harm, by construction.
+        let unsafe_run = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/genome/genomes/{invoice_id}/run"))
+                .set_json(serde_json::json!({
+                    "inputs": {
+                        "amount": {"kind":"money","value":5000.0},
+                        "contract_value": {"kind":"money","value":1000.0},
+                        "customer_active": {"kind":"flag","value":true},
+                        "discount_pct": {"kind":"money","value":5.0}
+                    },
+                    "outcome_value": 5000.0
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(unsafe_run.status(), StatusCode::ACCEPTED);
+        let unsafe_body: Value = test::read_body_json(unsafe_run).await;
+        assert_eq!(unsafe_body["data"]["status"], "blocked");
+        assert!(!unsafe_body["data"]["admitted"].as_bool().unwrap());
+
+        // Forking by a plain-language refinement yields a child one generation
+        // deeper that preserves the parent's guarantees.
+        let dunning = genomes["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["operation"] == "billing.dunning")
+            .unwrap();
+        let dunning_id = dunning["genome_id"].as_str().unwrap();
+        let fork = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/genome/genomes/{dunning_id}/fork"))
+                .set_json(serde_json::json!({"deviations": "require manager approval"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(fork.status(), StatusCode::CREATED);
+        let fork_body: Value = test::read_body_json(fork).await;
+        assert_eq!(fork_body["data"]["genome"]["generation"], 1);
+        assert!(
+            fork_body["data"]["refinement"]["is_refinement"]
+                .as_bool()
+                .unwrap()
+        );
+
+        // The commons graph now has an extra refinement edge.
+        let graph_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/genome/commons")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(graph_resp.status(), StatusCode::OK);
+        let graph: Value = test::read_body_json(graph_resp).await;
+        assert!(!graph["data"]["edges"].as_array().unwrap().is_empty());
+
+        // The underwriting desk reports concentration limits and a tail.
+        let risk_resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/genome/risk")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(risk_resp.status(), StatusCode::OK);
+        let risk: Value = test::read_body_json(risk_resp).await;
+        assert!(
+            risk["data"]["portfolio_tail_loss_99"].as_f64().unwrap()
+                >= risk["data"]["portfolio_expected_loss"].as_f64().unwrap()
+        );
     }
 
     fn test_config(environment: &str, admin_token: Option<&str>) -> AppConfig {

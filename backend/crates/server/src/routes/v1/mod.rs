@@ -5,18 +5,32 @@ use astra_core::{
     common::TenantScope,
 };
 
+mod active_inference;
 mod agent;
 mod architect;
 mod artifacts;
 mod asc2;
 mod assistant;
 mod autonomy;
+mod axiom;
+mod ceo;
 mod chronicle;
 mod connectors;
+mod continuum;
+mod crucible;
+mod curriculum;
+mod deep_research;
 mod device;
+mod evals;
+mod experiments;
 mod forge;
+mod genome;
+mod governance;
 mod httpa;
+mod learning;
+mod neural_orchestration;
 mod nexus;
+mod noesis;
 mod os_guardian;
 mod proof;
 mod render;
@@ -31,18 +45,32 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/v1")
             .configure(system::configure)
+            .configure(active_inference::configure)
             .configure(agent::configure)
             .configure(architect::configure)
             .configure(asc2::configure)
             .configure(assistant::configure)
             .configure(autonomy::configure)
+            .configure(axiom::configure)
+            .configure(ceo::configure)
             .configure(artifacts::configure)
             .configure(chronicle::configure)
             .configure(connectors::configure)
+            .configure(continuum::configure)
+            .configure(crucible::configure)
+            .configure(curriculum::configure)
+            .configure(deep_research::configure)
             .configure(device::configure)
+            .configure(evals::configure)
+            .configure(experiments::configure)
             .configure(forge::configure)
+            .configure(genome::configure)
+            .configure(governance::configure)
             .configure(httpa::configure)
+            .configure(learning::configure)
             .configure(nexus::configure)
+            .configure(neural_orchestration::configure)
+            .configure(noesis::configure)
             .configure(os_guardian::configure)
             .configure(proof::configure)
             .configure(render::configure)

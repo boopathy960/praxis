@@ -18,8 +18,8 @@ const STOPWORDS: &[&str] = &[
     "way", "who", "boy", "did", "its", "let", "put", "say", "she", "too", "use", "that", "this",
     "with", "have", "from", "they", "will", "would", "there", "their", "what", "about", "which",
     "when", "make", "like", "time", "just", "know", "take", "into", "your", "some", "could",
-    "them", "than", "then", "look", "only", "come", "over", "also", "back", "after", "use",
-    "does", "must", "should", "shall", "been", "being", "were", "such", "very", "much",
+    "them", "than", "then", "look", "only", "come", "over", "also", "back", "after", "use", "does",
+    "must", "should", "shall", "been", "being", "were", "such", "very", "much",
 ];
 
 /// Cosine similarity in [0, 1] over content-word term frequencies.
@@ -52,7 +52,11 @@ fn cosine(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> f64 {
         .sum();
     let norm = |v: &BTreeMap<String, f64>| v.values().map(|w| w * w).sum::<f64>().sqrt();
     let denom = norm(a) * norm(b);
-    if denom <= 0.0 { 0.0 } else { (dot / denom).clamp(0.0, 1.0) }
+    if denom <= 0.0 {
+        0.0
+    } else {
+        (dot / denom).clamp(0.0, 1.0)
+    }
 }
 
 #[cfg(test)]
@@ -66,7 +70,10 @@ mod tests {
 
     #[test]
     fn disjoint_vocabulary_is_zero() {
-        assert_eq!(similarity("banana bread recipe", "rust compiler internals"), 0.0);
+        assert_eq!(
+            similarity("banana bread recipe", "rust compiler internals"),
+            0.0
+        );
     }
 
     #[test]

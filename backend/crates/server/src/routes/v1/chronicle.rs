@@ -8,7 +8,10 @@ use astra_core::{
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/chronicle/episodes", web::post().to(record_episode))
         .route("/chronicle/episodes", web::get().to(list_episodes))
-        .route("/chronicle/episodes/{episode_id}", web::get().to(get_episode))
+        .route(
+            "/chronicle/episodes/{episode_id}",
+            web::get().to(get_episode),
+        )
         .route("/chronicle/recall", web::post().to(recall))
         .route("/chronicle/commitments", web::get().to(commitments))
         .route(

@@ -199,7 +199,9 @@ where
     std::thread::Builder::new()
         .name("astra-blocking-io".into())
         .spawn(task)
-        .map_err(|error| AppError::Internal(format!("failed to spawn blocking io thread: {error}")))?
+        .map_err(|error| {
+            AppError::Internal(format!("failed to spawn blocking io thread: {error}"))
+        })?
         .join()
         .map_err(|_| AppError::Internal("blocking io thread panicked".into()))?
 }

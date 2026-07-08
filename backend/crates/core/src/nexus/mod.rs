@@ -593,7 +593,10 @@ pub struct NexusService {
 }
 
 impl NexusService {
-    pub fn new(data_dir: impl AsRef<Path>, semantic_render: Option<crate::Shared<crate::semantic_render::SemanticRenderEngine>>) -> Result<Self, AppError> {
+    pub fn new(
+        data_dir: impl AsRef<Path>,
+        semantic_render: Option<crate::Shared<crate::semantic_render::SemanticRenderEngine>>,
+    ) -> Result<Self, AppError> {
         std::fs::create_dir_all(data_dir.as_ref()).map_err(|error| {
             AppError::Internal(format!("failed to create Nexus data directory: {error}"))
         })?;
@@ -1094,14 +1097,19 @@ impl NexusService {
             if let Some(url) = processed_data.get("website_url").and_then(|v| v.as_str()) {
                 let mut engine = semantic.write();
                 if let Ok(html) = safe_fetch::safe_fetch_html(url) {
-                    if let Ok(report) = engine.render(crate::semantic_render::SemanticRenderRequest {
-                        url: url.into(),
-                        html,
-                        content_type: "text/html".into(),
-                        notarize_to_chain: false,
-                    }) {
+                    if let Ok(report) =
+                        engine.render(crate::semantic_render::SemanticRenderRequest {
+                            url: url.into(),
+                            html,
+                            content_type: "text/html".into(),
+                            notarize_to_chain: false,
+                        })
+                    {
                         if let Some(obj) = processed_data.as_object_mut() {
-                            obj.insert("semantic_enrichment".into(), serde_json::to_value(report).unwrap_or_default());
+                            obj.insert(
+                                "semantic_enrichment".into(),
+                                serde_json::to_value(report).unwrap_or_default(),
+                            );
                         }
                     }
                 }
@@ -1325,19 +1333,26 @@ impl NexusService {
             if let Some(semantic) = &self.semantic_render {
                 let mut engine = semantic.write();
                 if let Ok(html) = safe_fetch::safe_fetch_html(url) {
-                    if let Ok(report) = engine.render(crate::semantic_render::SemanticRenderRequest {
-                        url: url.clone(),
-                        html,
-                        content_type: "text/html".into(),
-                        notarize_to_chain: true,
-                    }) {
+                    if let Ok(report) =
+                        engine.render(crate::semantic_render::SemanticRenderRequest {
+                            url: url.clone(),
+                            html,
+                            content_type: "text/html".into(),
+                            notarize_to_chain: true,
+                        })
+                    {
                         semantic_data = serde_json::to_value(report).unwrap_or_default();
                     }
                 }
             }
 
             // Fan out into different departmental events for agents to pick up
-            let departments = ["audit.finance", "audit.legal", "audit.hr", "audit.compliance"];
+            let departments = [
+                "audit.finance",
+                "audit.legal",
+                "audit.hr",
+                "audit.compliance",
+            ];
             for dept in departments {
                 let event = BusinessEvent {
                     event_id: new_id("nexus_event"),
@@ -1406,12 +1421,14 @@ impl NexusService {
             if let Some(semantic) = &self.semantic_render {
                 let mut engine = semantic.write();
                 if let Ok(html) = safe_fetch::safe_fetch_html(&monitor.url) {
-                    if let Ok(report) = engine.render(crate::semantic_render::SemanticRenderRequest {
-                        url: monitor.url.clone(),
-                        html,
-                        content_type: "text/html".into(),
-                        notarize_to_chain: false,
-                    }) {
+                    if let Ok(report) =
+                        engine.render(crate::semantic_render::SemanticRenderRequest {
+                            url: monitor.url.clone(),
+                            html,
+                            content_type: "text/html".into(),
+                            notarize_to_chain: false,
+                        })
+                    {
                         let new_hash = report.content_hash.clone();
                         if monitor.last_content_hash.as_deref() != Some(new_hash.as_str()) {
                             monitor.last_content_hash = Some(new_hash);
@@ -1435,7 +1452,10 @@ impl NexusService {
                                     "url": monitor.url,
                                     "semantic_enrichment": report
                                 }),
-                                idempotency_key: Some(format!("{}_{}", monitor.monitor_id, report.content_hash)),
+                                idempotency_key: Some(format!(
+                                    "{}_{}",
+                                    monitor.monitor_id, report.content_hash
+                                )),
                                 occurred_at_ms: now_ms(),
                                 ingested_at_ms: now_ms(),
                             };
@@ -4779,8 +4799,11 @@ mod tests {
     use super::*;
 
     fn service(label: &str) -> NexusService {
-        NexusService::new(std::env::temp_dir().join(format!("nexus-test-{label}-{}", now_ms())), None)
-            .expect("service")
+        NexusService::new(
+            std::env::temp_dir().join(format!("nexus-test-{label}-{}", now_ms())),
+            None,
+        )
+        .expect("service")
     }
 
     fn organization(service: &NexusService) -> Organization {

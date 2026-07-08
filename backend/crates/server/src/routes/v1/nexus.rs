@@ -484,7 +484,9 @@ async fn ingest_event(
     let mut result =
         web::block(move || nexus.ingest_event(&principal, &blocking_org, event_request))
             .await
-            .map_err(|error| AppError::Internal(format!("nexus event ingestion failed: {error}")))??;
+            .map_err(|error| {
+                AppError::Internal(format!("nexus event ingestion failed: {error}"))
+            })??;
     for run in &mut result.triggered_runs {
         *run = attach_reasoning(&state, &organization_id, run.agent, run.clone()).await?;
     }

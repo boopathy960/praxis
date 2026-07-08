@@ -409,11 +409,15 @@ impl Default for HttpaService {
 
 /// Drops expired sessions and stale revocation tombstones.
 fn purge_expired(store: &mut HttpaStore, now: i64) {
-    store.sessions.retain(|_, session| session.expires_at_ms >= now);
+    store
+        .sessions
+        .retain(|_, session| session.expires_at_ms >= now);
     store
         .session_use_counts
         .retain(|session_id, _| store.sessions.contains_key(session_id));
-    store.revoked_sessions.retain(|_, keep_until| *keep_until >= now);
+    store
+        .revoked_sessions
+        .retain(|_, keep_until| *keep_until >= now);
 }
 
 fn normalize_device_id(device_id: &str) -> Result<String, AppError> {

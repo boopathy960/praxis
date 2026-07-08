@@ -1,0 +1,8 @@
+[package]
+name = "praxis-host"
+version = "0.1.0"
+edition = "2021"
+description = "The Praxis nucleus on a hosted console — run the kernel core anywhere, today."
+
+[dependencies]
+praxis-nucleus = { path = "../nucleus" }

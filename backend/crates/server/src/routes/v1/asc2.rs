@@ -3,7 +3,7 @@ use astra_core::{
     AppState,
     asc2::{
         Asc2BenchmarkRequest, Asc2MissionRequest, AssessRequest, AutonomousSelfModRequest,
-        EvolveRequest, IdeationRequest, SelfModificationCandidate,
+        IdeationRequest, SelfModificationCandidate,
     },
     common::{ApiResponse, AppError},
 };
@@ -38,7 +38,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         )
         .route("/asc2/prompts/revert", web::post().to(revert_role_prompt))
         .route("/asc2/ideate", web::post().to(ideate))
-        .route("/asc2/evolve", web::post().to(evolve))
         .route("/asc2/assess", web::post().to(assess));
 }
 
@@ -108,14 +107,12 @@ async fn list_self_modifications(state: web::Data<AppState>) -> Result<HttpRespo
     Ok(HttpResponse::Ok().json(ApiResponse::ok(state.asc2.self_modifications()?)))
 }
 
-/// Validate and stage a candidate self-modification: the server formats, tests,
-/// and **release-builds** the candidate workspace, then stages (and, when
-/// `ASTRA_ASC2_AUTO_PROMOTE=true`, promotes) the resulting binary for the
-/// rollback supervisor to pick up. This is the binary self-modification entry
-/// point — it spawns `cargo` and can swap the running binary, so it is:
-///   * **admin-gated** (production requires `x-astra-admin-token`), and
-///   * gated again inside the service by a *promotable* benchmark, a changed-path
-///     allowlist, and existence checks on the workspace + rollback binary.
+/// Validate and **stage** a candidate self-modification: the server formats,
+/// tests, and release-builds the candidate workspace and stages the binary. This
+/// direct path NEVER promotes — promotion is authorized only by the governance
+/// court (via the CEO's `SelfModification` proposal flow), not by a human or an
+/// env flag. Still admin-gated, and gated again inside by a *promotable*
+/// benchmark, a changed-path allowlist, and workspace/rollback existence checks.
 /// Body: `{ "workspace_path": "...", "changed_paths": ["asc2/prompts/..."], "current_binary": "..." }`.
 async fn stage_self_modification(
     state: web::Data<AppState>,
@@ -126,8 +123,10 @@ async fn stage_self_modification(
     let candidate = body.into_inner();
     let asc2 = state.asc2.clone();
     // fmt/test/`build --release` is heavy and spawns processes — keep it off the
-    // async worker pool.
-    let record = web::block(move || asc2.validate_and_stage_candidate(candidate))
+    // async worker pool. `authorized = false`: this direct/admin path may stage
+    // and validate, but NEVER promotes — only the governance court (via the CEO)
+    // can authorize a promotion.
+    let record = web::block(move || asc2.validate_and_stage_candidate(candidate, false))
         .await
         .map_err(|error| {
             AppError::Internal(format!("self-modification staging task failed: {error}"))
@@ -161,19 +160,6 @@ async fn ideate(
 ) -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(ApiResponse::ok(
         state.asc2.autonomous_ideation(body.into_inner()).await?,
-    )))
-}
-
-/// One self-evolution round: think (ideation + adversarial critique) toward a
-/// goal, propose the best survivor, and stop at the promotion gate. The
-/// `auto_promote` gate is connected but stays closed — nothing is applied.
-/// Body: `{ "goal": "...", "candidates": 4 }`.
-async fn evolve(
-    state: web::Data<AppState>,
-    body: web::Json<EvolveRequest>,
-) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(ApiResponse::ok(
-        state.asc2.self_evolve(body.into_inner()).await?,
     )))
 }
 

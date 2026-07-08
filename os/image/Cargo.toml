@@ -1,0 +1,15 @@
+[package]
+name = "praxis-image"
+version = "0.1.0"
+edition = "2021"
+description = "Builds a bootable Praxis OS disk image (BIOS + UEFI) from the kernel ELF."
+
+# A std host tool: it takes the freestanding kernel ELF and wraps it in a
+# bootable FAT image with the `bootloader` crate's builder half. Kept out of the
+# freestanding build — this runs on the developer's machine, not the kernel.
+[[bin]]
+name = "praxis-image"
+path = "src/main.rs"
+
+[dependencies]
+bootloader = "0.11"

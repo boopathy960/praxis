@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::common::{new_id, now_ms};
+use crate::sandbox::{SandboxAction, SandboxActionKind, SandboxService};
 
 /// How many finished operations to keep in the in-memory audit ring that the
 /// live-watch endpoint reads from.
@@ -280,6 +281,14 @@ pub struct DeviceCapabilities {
     /// Governed deep-crawl engine (HTTPA + safe-fetch + semantic render). When
     /// present, agents gain the `deep_crawl` tool.
     crawl: Option<Arc<crate::deep_crawl::DeepCrawlEngine>>,
+    /// The sandbox perimeter the device layer runs INSIDE. When set, every host
+    /// operation is routed through the sandbox first: it is recorded in the
+    /// unified audit ledger and subject to the perimeter's *containment* — a
+    /// global lockdown, a sealed principal, or a breakout/honeypot tripwire halts
+    /// the op. The device's deliberately-permissive routine execution is
+    /// unchanged ("allow everything, watch"); what enclosure adds is that the
+    /// perimeter can now *see* and *freeze* the host hands.
+    perimeter: Option<SandboxService>,
 }
 
 impl DeviceCapabilities {
@@ -289,6 +298,7 @@ impl DeviceCapabilities {
             policy: Arc::new(policy),
             supervisor: DeviceSupervisor::new(),
             crawl: None,
+            perimeter: None,
         }
     }
 
@@ -298,6 +308,51 @@ impl DeviceCapabilities {
     pub fn with_crawl(mut self, crawl: Arc<crate::deep_crawl::DeepCrawlEngine>) -> Self {
         self.crawl = Some(crawl);
         self
+    }
+
+    /// Enclose the device layer inside the sandbox perimeter (see `perimeter`).
+    #[must_use]
+    pub fn with_perimeter(mut self, sandbox: SandboxService) -> Self {
+        self.perimeter = Some(sandbox);
+        self
+    }
+
+    /// True if the device layer is enclosed inside the sandbox perimeter.
+    #[must_use]
+    pub fn is_enclosed(&self) -> bool {
+        self.perimeter.is_some()
+    }
+
+    /// The perimeter containment gate run before every host operation. Returns
+    /// `Err(reason)` only when the sandbox has CONTAINED this principal (global
+    /// lockdown, seal, or a breakout/honeypot tripwire) — routine permissive ops
+    /// pass through (and are audited inside the sandbox). Fails closed: if the
+    /// perimeter itself errors we refuse, because we cannot verify containment.
+    fn enclosure_gate(&self, canonical: &str, input: &Value) -> Result<(), String> {
+        let Some(perimeter) = &self.perimeter else {
+            return Ok(());
+        };
+        let action = device_sandbox_action(canonical, input);
+        match perimeter.guard(action, false) {
+            Ok(receipt) => {
+                let status = receipt
+                    .observation
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if status == "perimeter_lockdown" {
+                    Err(format!(
+                        "sandbox perimeter halted the host operation: {}",
+                        receipt.decision.reason
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(format!(
+                "sandbox perimeter unavailable; device op failed closed: {error}"
+            )),
+        }
     }
 
     #[must_use]
@@ -317,6 +372,7 @@ impl DeviceCapabilities {
         &[
             "system_info",
             "process_list",
+            "net_connections",
             "disk_usage",
             "fs_list",
             "fs_read",
@@ -325,6 +381,7 @@ impl DeviceCapabilities {
             "shell_exec",
             "deep_crawl",
             "web_search",
+            "http_get",
         ]
     }
 
@@ -332,6 +389,16 @@ impl DeviceCapabilities {
     /// supervisor: begin → run → finish, so nothing escapes the watch.
     pub fn execute(&self, tool: &str, input: &Value) -> Result<Value, String> {
         let canonical = canonical_device_tool(tool);
+        // Enclosure: the device layer is INSIDE the sandbox perimeter. Every host
+        // op crosses the perimeter first — audited, and halted if the principal is
+        // under lockdown/seal or trips a breakout/honeypot wire. This applies to
+        // ALL tools (including crawl/web_search) before any dispatch.
+        if let Err(reason) = self.enclosure_gate(canonical, input) {
+            let op_id = self.supervisor.begin(canonical, "perimeter-refused");
+            self.supervisor
+                .finish(&op_id, canonical, "", "blocked", &reason);
+            return Err(reason);
+        }
         // The crawl engine runs its own supervision, so its tools are dispatched
         // before the single-op wrapper below.
         if canonical == "deep_crawl" {
@@ -360,7 +427,9 @@ impl DeviceCapabilities {
                     "completed",
                     &v.to_string().chars().take(200).collect::<String>(),
                 ),
-                Err(e) => self.supervisor.finish(&op_id, "web_search", "", "failed", e),
+                Err(e) => self
+                    .supervisor
+                    .finish(&op_id, "web_search", "", "failed", e),
             }
             return result;
         }
@@ -369,12 +438,14 @@ impl DeviceCapabilities {
         let result = match canonical {
             "system_info" => self.system_info(),
             "process_list" => self.process_list(input),
+            "net_connections" => self.net_connections(input),
             "disk_usage" => self.disk_usage(),
             "fs_list" => self.fs_list(input),
             "fs_read" => self.fs_read(input),
             "fs_write" => self.fs_write(input),
             "open_path" => self.open_path(input),
             "shell_exec" => self.shell_exec(input, &op_id),
+            "http_get" => self.http_get(input),
             other => Err(format!("unknown device tool '{other}'")),
         };
         match &result {
@@ -439,9 +510,15 @@ impl DeviceCapabilities {
             .unwrap_or(40)
             .clamp(1, 500) as usize;
         let (program, args) = if cfg!(windows) {
-            ("tasklist", vec!["/fo".to_string(), "csv".to_string(), "/nh".to_string()])
+            (
+                "tasklist",
+                vec!["/fo".to_string(), "csv".to_string(), "/nh".to_string()],
+            )
         } else {
-            ("ps", vec!["-eo".to_string(), "pid,comm,%cpu,%mem".to_string()])
+            (
+                "ps",
+                vec!["-eo".to_string(), "pid,comm,%cpu,%mem".to_string()],
+            )
         };
         let output = self.run_capture(program, &args)?;
         let lines: Vec<String> = output
@@ -455,6 +532,37 @@ impl DeviceCapabilities {
             "source": program,
             "count": lines.len(),
             "processes": lines,
+        }))
+    }
+
+    /// Enumerate the host's network connections and listening sockets — the
+    /// primary exfiltration/backdoor signal. Read-only: `netstat -ano` on
+    /// Windows, `ss -tunap` elsewhere. Each row carries proto, local + foreign
+    /// address, state, and (where available) the owning PID.
+    fn net_connections(&self, input: &Value) -> Result<Value, String> {
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(300)
+            .clamp(1, 4000) as usize;
+        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("netstat", vec!["-ano".into()])
+        } else {
+            ("ss", vec!["-tunap".into()])
+        };
+        let output = self.run_capture(program, &args)?;
+        let lines: Vec<String> = output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(limit)
+            .map(str::to_string)
+            .collect();
+        Ok(json!({
+            "tool": "net_connections",
+            "source": program,
+            "count": lines.len(),
+            "connections": lines,
         }))
     }
 
@@ -485,8 +593,8 @@ impl DeviceCapabilities {
     }
 
     fn fs_list(&self, input: &Value) -> Result<Value, String> {
-        let raw = string_arg(input, &["path", "dir", "directory"])
-            .ok_or("fs_list requires a 'path'")?;
+        let raw =
+            string_arg(input, &["path", "dir", "directory"]).ok_or("fs_list requires a 'path'")?;
         let path = self.resolve_path(&raw)?;
         let read = std::fs::read_dir(&path).map_err(|e| format!("read_dir failed: {e}"))?;
         let mut entries = Vec::new();
@@ -550,7 +658,10 @@ impl DeviceCapabilities {
             .ok_or("open_path requires a 'path' or 'url'")?;
         self.guard_command(&target)?;
         let (program, args): (&str, Vec<String>) = if cfg!(windows) {
-            ("cmd", vec!["/C".into(), "start".into(), String::new(), target.clone()])
+            (
+                "cmd",
+                vec!["/C".into(), "start".into(), String::new(), target.clone()],
+            )
         } else if cfg!(target_os = "macos") {
             ("open", vec![target.clone()])
         } else {
@@ -574,22 +685,33 @@ impl DeviceCapabilities {
     /// drain stdout/stderr (so a chatty child can't deadlock on a full pipe),
     /// while this loop watches the clock and force-kills on timeout.
     fn shell_exec(&self, input: &Value, op_id: &str) -> Result<Value, String> {
-        let command =
-            string_arg(input, &["command", "cmd", "script"]).ok_or("shell_exec requires a 'command'")?;
+        let command = string_arg(input, &["command", "cmd", "script"])
+            .ok_or("shell_exec requires a 'command'")?;
         self.guard_command(&command)?;
         let cwd = string_arg(input, &["cwd", "dir"])
             .map(|raw| self.resolve_path(&raw))
             .transpose()?
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
-            ("cmd", vec!["/C".into(), command.clone()])
-        } else {
-            ("sh", vec!["-lc".into(), command.clone()])
-        };
-
-        let mut child = Command::new(program)
-            .args(&args)
+        // Build the shell invocation. On Windows the command line is passed to
+        // `cmd /C` VERBATIM via `raw_arg`: Rust's default arg quoting rewrites an
+        // inner `"` as `\"`, which cmd does not understand — that silently breaks
+        // `&` inside a quoted URL (cmd reads it as a command separator) and `$`
+        // inside a nested `powershell -Command "..."`. Passing the raw line lets
+        // cmd apply its OWN quoting rules, so quoted URLs and nested PowerShell
+        // execute the way the model intends, while cmd semantics (`&&`, `dir /s`)
+        // are preserved.
+        let mut builder = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            builder.raw_arg(format!("/C {command}"));
+        }
+        #[cfg(not(windows))]
+        {
+            builder.arg("-lc").arg(&command);
+        }
+        let mut child = builder
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -607,8 +729,7 @@ impl DeviceCapabilities {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(self.policy.command_timeout_ms);
-        let timeout =
-            Duration::from_millis(requested.min(self.policy.command_timeout_ms).max(100));
+        let timeout = Duration::from_millis(requested.min(self.policy.command_timeout_ms).max(100));
         let pid = child.id();
         let start = Instant::now();
         let mut killed = false;
@@ -635,8 +756,12 @@ impl DeviceCapabilities {
             }
         };
 
-        let stdout = out_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-        let stderr = err_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+        let stdout = out_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        let stderr = err_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
         let duration_ms = start.elapsed().as_millis() as i64;
 
         Ok(json!({
@@ -649,6 +774,32 @@ impl DeviceCapabilities {
             "duration_ms": duration_ms,
             "stdout": stdout,
             "stderr": stderr,
+        }))
+    }
+
+    /// A read-only HTTP GET — fetch a URL's body (a JSON API response or a web
+    /// page) straight into an observation, with NO shell and therefore none of
+    /// the quoting/escaping that breaks `curl`/`Invoke-RestMethod` through
+    /// `cmd /C`. SSRF-guarded (private/loopback hosts blocked) and size-capped via
+    /// [`safe_fetch_html`](crate::nexus::safe_fetch::safe_fetch_html). This is the
+    /// clean way for an agent to pull live web data.
+    fn http_get(&self, input: &Value) -> Result<Value, String> {
+        let url = string_arg(input, &["url", "uri", "href", "endpoint"])
+            .ok_or("http_get requires a 'url'")?;
+        let body = crate::nexus::safe_fetch::safe_fetch_html(&url)?;
+        let cap = self.policy.max_output_bytes.min(64 * 1024);
+        let truncated = body.len() > cap;
+        let body = if truncated {
+            body.chars().take(cap).collect::<String>()
+        } else {
+            body
+        };
+        Ok(json!({
+            "tool": "http_get",
+            "url": url,
+            "status": "ok",
+            "truncated": truncated,
+            "body": body,
         }))
     }
 
@@ -703,9 +854,7 @@ impl DeviceCapabilities {
             return Ok(candidate.to_path_buf());
         }
         if self.policy.allowed_roots.is_empty() {
-            return Err(
-                "device is in confined mode but no allowed roots are configured".into(),
-            );
+            return Err("device is in confined mode but no allowed roots are configured".into());
         }
         if candidate
             .components()
@@ -772,6 +921,52 @@ where
     })
 }
 
+/// The principal every device-layer host op is attributed to inside the sandbox
+/// audit. A global lockdown halts it regardless (it seals `__global__`), and a
+/// breakout/honeypot via the device seals this principal specifically.
+const DEVICE_PRINCIPAL: &str = "device-layer";
+
+/// Build the `SandboxAction` that represents a device tool call to the perimeter,
+/// so the sandbox can audit it and apply containment (lockdown/seal/tripwires).
+fn device_sandbox_action(canonical: &str, input: &Value) -> SandboxAction {
+    let (kind, command, path, url) = match canonical {
+        "fs_write" => (
+            SandboxActionKind::FileWrite,
+            None,
+            string_arg(input, &["path"]),
+            None,
+        ),
+        "fs_read" | "fs_list" | "open_path" => (
+            SandboxActionKind::FileRead,
+            None,
+            string_arg(input, &["path"]),
+            None,
+        ),
+        "shell_exec" => (
+            SandboxActionKind::ShellExecution,
+            string_arg(input, &["command", "cmd"]),
+            None,
+            None,
+        ),
+        "deep_crawl" | "web_search" | "http_get" => (
+            SandboxActionKind::NetworkFetch,
+            None,
+            None,
+            string_arg(input, &["url", "query", "q"]),
+        ),
+        // system_info / process_list / disk_usage — host introspection ~ a read.
+        _ => (SandboxActionKind::FileRead, None, None, None),
+    };
+    SandboxAction {
+        kind,
+        command,
+        path,
+        url,
+        session_id: Some(DEVICE_PRINCIPAL.into()),
+        ..SandboxAction::default()
+    }
+}
+
 /// Map loosely-named tool requests onto the canonical device tool set.
 #[must_use]
 pub fn canonical_device_tool(tool: &str) -> &'static str {
@@ -788,6 +983,14 @@ pub fn canonical_device_tool(tool: &str) -> &'static str {
         "system_info"
     } else if lower.contains("process") || lower == "ps" || lower.contains("tasklist") {
         "process_list"
+    } else if lower.contains("netstat")
+        || lower.contains("connection")
+        || lower.contains("socket")
+        || lower == "net_connections"
+        || lower == "netconn"
+        || lower == "ss"
+    {
+        "net_connections"
     } else if lower.contains("disk") || lower.contains("storage") {
         "disk_usage"
     } else if lower.contains("list") && lower.contains("file")
@@ -801,6 +1004,8 @@ pub fn canonical_device_tool(tool: &str) -> &'static str {
         "fs_write"
     } else if lower.contains("open") || lower.contains("launch") {
         "open_path"
+    } else if lower.contains("http") || lower == "fetch" || lower == "get_url" {
+        "http_get"
     } else {
         "shell_exec"
     }
@@ -825,11 +1030,17 @@ pub fn is_device_tool(tool: &str) -> bool {
         || lower == "ls"
         || lower == "dir"
         || lower == "sysinfo"
+        || lower.contains("http")
+        || lower.contains("netstat")
+        || lower.contains("connection")
+        || lower.contains("socket")
+        || lower == "netconn"
 }
 
 fn describe_call(tool: &str, input: &Value) -> String {
     match tool {
         "shell_exec" => string_arg(input, &["command", "cmd", "script"]).unwrap_or_default(),
+        "http_get" => string_arg(input, &["url", "uri", "href", "endpoint"]).unwrap_or_default(),
         "open_path" => string_arg(input, &["path", "url", "target"]).unwrap_or_default(),
         "fs_read" | "fs_write" | "fs_list" => {
             string_arg(input, &["path", "file", "dir"]).unwrap_or_default()
@@ -877,10 +1088,42 @@ mod tests {
     }
 
     #[test]
+    fn device_layer_is_enclosed_by_the_perimeter() {
+        // The device — the project's real host hands — runs INSIDE the sandbox.
+        // Its permissive routine ops proceed, but a global lockdown freezes them:
+        // nothing the project does escapes the perimeter the court commands.
+        let dir = std::env::temp_dir().join(format!("astra-encl-{}", now_ms()));
+        let sandbox = SandboxService::new(dir).expect("sandbox");
+        let device =
+            DeviceCapabilities::new(DevicePolicy::permissive()).with_perimeter(sandbox.clone());
+        assert!(device.is_enclosed());
+
+        // Inside the perimeter, a benign host op still runs (permissive design).
+        device
+            .execute("system_info", &json!({}))
+            .expect("op runs inside the perimeter");
+
+        // The court locks the whole system down -> the host hands freeze too.
+        sandbox.seal_global("emergency drill").expect("lockdown");
+        let blocked = device.execute("system_info", &json!({}));
+        assert!(
+            blocked.is_err(),
+            "a global lockdown must halt the enclosed device layer"
+        );
+        assert!(blocked.unwrap_err().contains("perimeter"));
+    }
+
+    #[test]
     fn shell_exec_runs_and_captures() {
         let device = DeviceCapabilities::new(DevicePolicy::permissive());
-        let cmd = if cfg!(windows) { "echo hello" } else { "echo hello" };
-        let value = device.execute("shell_exec", &json!({ "command": cmd })).unwrap();
+        let cmd = if cfg!(windows) {
+            "echo hello"
+        } else {
+            "echo hello"
+        };
+        let value = device
+            .execute("shell_exec", &json!({ "command": cmd }))
+            .unwrap();
         assert!(value["stdout"].as_str().unwrap().contains("hello"));
         assert_eq!(value["killed"], json!(false));
     }

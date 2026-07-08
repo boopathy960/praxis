@@ -31,7 +31,11 @@ async fn forge_tool(
         format!(
             "forged tool '{}' ({}) — {}",
             outcome.tool.name,
-            if outcome.minted { "minted/active" } else { "probation" },
+            if outcome.minted {
+                "minted/active"
+            } else {
+                "probation"
+            },
             outcome.detail
         ),
         "forge",
@@ -90,10 +94,7 @@ async fn heal(
     super::remember(
         &state,
         EpisodeKind::Learning,
-        format!(
-            "healed forged tool '{}' — {}",
-            outcome.name, outcome.detail
-        ),
+        format!("healed forged tool '{}' — {}", outcome.name, outcome.detail),
         "forge",
         Some(outcome.new_tool.tool_id.clone()),
         if outcome.healed {

@@ -1,0 +1,19 @@
+[package]
+name = "praxis-boot"
+version = "0.1.0"
+edition = "2021"
+description = "Praxis OS bare-metal image: the nucleus on x86_64, no host OS beneath it."
+
+[dependencies]
+praxis-nucleus = { path = "../nucleus" }
+# The boot protocol only (kernel-side, no_std): entry point + memory map.
+# Everything past the handoff — heap, scheduler, drivers, shell — is ours.
+bootloader_api = "0.11"
+
+# A kernel binary has no host test harness (std's panic handler would collide
+# with ours). Tests live in the nucleus, which runs anywhere.
+[[bin]]
+name = "praxis-boot"
+path = "src/main.rs"
+test = false
+bench = false

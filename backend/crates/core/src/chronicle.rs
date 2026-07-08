@@ -50,10 +50,10 @@ const ARCHIVE_THRESHOLD: f64 = 0.05;
 const INSIGHT_MIN_EPISODES: usize = 3;
 
 const STOPWORDS: &[&str] = &[
-    "about", "after", "again", "across", "their", "there", "these", "thing", "those",
-    "through", "under", "where", "which", "while", "with", "would", "into", "from",
-    "that", "this", "have", "will", "your", "they", "them", "were", "been", "what",
-    "when", "every", "should", "could", "using", "between",
+    "about", "after", "again", "across", "their", "there", "these", "thing", "those", "through",
+    "under", "where", "which", "while", "with", "would", "into", "from", "that", "this", "have",
+    "will", "your", "they", "them", "were", "been", "what", "when", "every", "should", "could",
+    "using", "between",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,7 +184,6 @@ pub struct ConsolidationReport {
     pub total_insights: usize,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ChronicleStats {
     pub total_episodes: usize,
@@ -237,7 +236,9 @@ impl ChronicleService {
         let store_path = data_dir.as_ref().join("chronicle.sqlite");
         if let Some(parent) = store_path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
-                AppError::Internal(format!("failed to create chronicle data directory: {error}"))
+                AppError::Internal(format!(
+                    "failed to create chronicle data directory: {error}"
+                ))
             })?;
         }
         let connection = Connection::open(&store_path).map_err(|error| {
@@ -315,7 +316,9 @@ impl ChronicleService {
             ));
         }
         if content.len() > MAX_CONTENT_LEN {
-            return Err(AppError::Validation("chronicle episode content is too long".into()));
+            return Err(AppError::Validation(
+                "chronicle episode content is too long".into(),
+            ));
         }
         let importance = request.importance.unwrap_or(0.5);
         if !importance.is_finite() || !(0.0..=1.0).contains(&importance) {
@@ -388,7 +391,9 @@ impl ChronicleService {
     pub fn recall(&self, request: RecallRequest) -> Result<RecallResponse, AppError> {
         let query = request.query.trim().to_ascii_lowercase();
         if query.is_empty() {
-            return Err(AppError::Validation("recall query must not be empty".into()));
+            return Err(AppError::Validation(
+                "recall query must not be empty".into(),
+            ));
         }
         let terms = significant_tokens(&query);
         let terms = if terms.is_empty() {
@@ -516,7 +521,10 @@ impl ChronicleService {
             tokens.sort();
             tokens.dedup();
             for token in tokens {
-                themes.entry(token).or_default().push(episode.episode_id.clone());
+                themes
+                    .entry(token)
+                    .or_default()
+                    .push(episode.episode_id.clone());
             }
         }
         let mut insights_promoted = 0;
@@ -577,7 +585,9 @@ impl ChronicleService {
         let mut open_commitments = 0;
         let mut overdue_commitments = 0;
         for episode in store.episodes.values() {
-            *by_kind.entry(episode.kind.as_str().to_string()).or_default() += 1;
+            *by_kind
+                .entry(episode.kind.as_str().to_string())
+                .or_default() += 1;
             if episode.archived {
                 archived += 1;
             }
@@ -637,11 +647,21 @@ impl ChronicleService {
     }
 
     fn persist_episode(&self, episode: &Episode) -> Result<(), AppError> {
-        self.persist("chronicle_episodes", "episode_id", &episode.episode_id, episode)
+        self.persist(
+            "chronicle_episodes",
+            "episode_id",
+            &episode.episode_id,
+            episode,
+        )
     }
 
     fn persist_insight(&self, insight: &Insight) -> Result<(), AppError> {
-        self.persist("chronicle_insights", "insight_id", &insight.insight_id, insight)
+        self.persist(
+            "chronicle_insights",
+            "insight_id",
+            &insight.insight_id,
+            insight,
+        )
     }
 
     fn persist<T: Serialize>(
@@ -662,7 +682,9 @@ impl ChronicleService {
         );
         db.lock()
             .execute(&sql, params![id, payload, now_ms()])
-            .map_err(|error| AppError::Internal(format!("chronicle persistence failed: {error}")))?;
+            .map_err(|error| {
+                AppError::Internal(format!("chronicle persistence failed: {error}"))
+            })?;
         Ok(())
     }
 }
@@ -758,7 +780,12 @@ mod tests {
     fn episodes_are_ordered_by_index() {
         let service = ChronicleService::new();
         let first = record(&service, EpisodeKind::Event, "first remembered event", 0.5);
-        let second = record(&service, EpisodeKind::Learning, "second remembered lesson", 0.5);
+        let second = record(
+            &service,
+            EpisodeKind::Learning,
+            "second remembered lesson",
+            0.5,
+        );
         assert_eq!(first.chain_index, 0);
         assert_eq!(second.chain_index, 1);
         service.consolidate().expect("consolidate");
@@ -788,7 +815,14 @@ mod tests {
         assert_eq!(response.matches.len(), 1);
         assert!(response.matches[0].episode.content.contains("sqlite"));
         assert!(response.matches[0].score > 0.0);
-        assert!(service.recall(RecallRequest { query: " ".into(), limit: None }).is_err());
+        assert!(
+            service
+                .recall(RecallRequest {
+                    query: " ".into(),
+                    limit: None
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -807,13 +841,20 @@ mod tests {
                 tenant_scope: TenantScope::Global,
             })
             .expect("record");
-        record(&service, EpisodeKind::Event, "unrelated background event", 0.5);
+        record(
+            &service,
+            EpisodeKind::Event,
+            "unrelated background event",
+            0.5,
+        );
 
         let views = service.commitments();
         assert_eq!(views.len(), 1);
         assert!(views[0].overdue);
 
-        let resolved = service.resolve_commitment(&overdue.episode_id).expect("resolve");
+        let resolved = service
+            .resolve_commitment(&overdue.episode_id)
+            .expect("resolve");
         assert!(resolved.resolved);
         assert!(service.commitments().is_empty());
         // Only commitments can be resolved.
@@ -833,7 +874,12 @@ mod tests {
             );
         }
         // A faint memory that should archive after one decay tick.
-        record(&service, EpisodeKind::Event, "barely notable happening", 0.05);
+        record(
+            &service,
+            EpisodeKind::Event,
+            "barely notable happening",
+            0.05,
+        );
         // An unresolved commitment must never archive, no matter how faint.
         service
             .record(RecordEpisodeRequest {
@@ -850,12 +896,18 @@ mod tests {
             .expect("record");
 
         let report = service.consolidate().expect("consolidate");
-        assert!(report.insights_promoted >= 1, "kubernetes theme should promote");
+        assert!(
+            report.insights_promoted >= 1,
+            "kubernetes theme should promote"
+        );
         assert_eq!(report.archived, 1, "only the faint event archives");
         assert_eq!(service.commitments().len(), 1, "commitment survives decay");
 
         let recall = service
-            .recall(RecallRequest { query: "kubernetes".into(), limit: None })
+            .recall(RecallRequest {
+                query: "kubernetes".into(),
+                limit: None,
+            })
             .expect("recall");
         assert!(!recall.related_insights.is_empty());
     }

@@ -60,6 +60,11 @@ pub struct SemanticRenderReport {
     /// and detected pagination links — the deep-collection payload agents read.
     #[serde(default)]
     pub structured: ExtractedData,
+    /// Content recovered from JavaScript hydration state (Next.js/Nuxt/Apollo/…)
+    /// by the Aletheia engine — what a JS-rendered ("needs a browser") page
+    /// actually says, extracted without executing any JavaScript.
+    #[serde(default)]
+    pub recovered: RecoveredContent,
     pub forms: usize,
     pub script_count: usize,
     pub iframe_count: usize,
@@ -105,6 +110,33 @@ pub struct ExtractedData {
     pub entity_types: Vec<String>,
     /// Detected "next page" URLs for deep multi-page collection.
     pub pagination_links: Vec<String>,
+}
+
+/// Content the Aletheia engine recovered from a page's JS hydration state — the
+/// body of a single-page app that a plain DOM read would see as blank, plus the
+/// pagination cursors that let a crawler follow the feed with no browser.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecoveredContent {
+    /// Reconstructed page text, from the state the framework would have rendered.
+    #[serde(default)]
+    pub text: String,
+    /// Strongest labelled content leaves (title, author, price, …) with paths.
+    #[serde(default)]
+    pub fields: Vec<crate::aletheia::RecoveredField>,
+    /// Continuation tokens (Relay cursors, next URLs, offset params) for
+    /// browser-free deep crawling of listings and infinite feeds.
+    #[serde(default)]
+    pub continuations: Vec<crate::aletheia::Continuation>,
+    /// How many JSON state blobs were parsed out of the page.
+    #[serde(default)]
+    pub state_blobs: usize,
+    /// Characters of content recovered from state.
+    #[serde(default)]
+    pub recovered_chars: usize,
+    /// Share of the page's meaning that lived only in JS state, in `[0,1]`:
+    /// ~0 for a static page, ~1 for a pure SPA whose DOM body is empty.
+    #[serde(default)]
+    pub js_content_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +247,29 @@ impl SemanticRenderEngine {
         let text_excerpt: String = body_text.chars().take(480).collect();
         let structured = extract_structured(html, &normalized_url, &open_graph);
 
+        // Aletheia: recover content from JS hydration state (Next.js/Nuxt/Apollo/
+        // Redux/embedded JSON) with no browser. This is what lets the engine
+        // "render" a single-page app whose DOM body is otherwise empty.
+        let state_blobs = extract_state_blobs(html);
+        let recovery = crate::aletheia::recover(&state_blobs);
+        let js_content_ratio =
+            crate::aletheia::js_content_ratio(body_text.len(), recovery.recovered_chars);
+        if recovery.recovered_chars > 0 && word_count < 50 {
+            warnings.push(format!(
+                "sparse DOM ({word_count} words) but {} chars recovered from JS state — \
+                 page is a single-page app; using Aletheia-recovered content",
+                recovery.recovered_chars
+            ));
+        }
+        let recovered = RecoveredContent {
+            text: recovery.recovered_text,
+            fields: recovery.recovered_fields,
+            continuations: recovery.continuations,
+            state_blobs: recovery.state_blobs,
+            recovered_chars: recovery.recovered_chars,
+            js_content_ratio,
+        };
+
         let proof_hash = sha3_hex(
             serde_json::json!({
                 "render_profile": RENDER_PROFILE,
@@ -237,6 +292,12 @@ impl SemanticRenderEngine {
                 "iframe_count": iframe_count,
                 "inline_event_handlers": inline_event_handlers,
                 "warnings": warnings,
+                // The recovered content is part of the attested extraction, so
+                // its digest binds into the proof hash too.
+                "recovered_chars": recovered.recovered_chars,
+                "recovered_state_blobs": recovered.state_blobs,
+                "recovered_text_hash": sha3_hex(recovered.text.as_bytes()),
+                "recovered_continuations": recovered.continuations.len(),
             })
             .to_string()
             .as_bytes(),
@@ -267,6 +328,7 @@ impl SemanticRenderEngine {
             table_count,
             json_ld_blocks,
             structured,
+            recovered,
             forms,
             script_count,
             iframe_count,
@@ -330,17 +392,26 @@ static_regex!(
 );
 static_regex!(regex_title, r#"(?is)<title[^>]*>(.*?)</title>"#);
 static_regex!(regex_heading, r#"(?is)<h[1-6][^>]*>(.*?)</h[1-6]>"#);
-static_regex!(regex_anchor, r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>"#);
+static_regex!(
+    regex_anchor,
+    r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>"#
+);
 static_regex!(regex_tag, r#"(?is)<[^>]+>"#);
 static_regex!(regex_meta, r#"(?is)<meta\b[^>]*>"#);
 static_regex!(regex_attr_name, r#"(?is)name\s*=\s*["']([^"']+)["']"#);
-static_regex!(regex_attr_property, r#"(?is)property\s*=\s*["']([^"']+)["']"#);
+static_regex!(
+    regex_attr_property,
+    r#"(?is)property\s*=\s*["']([^"']+)["']"#
+);
 static_regex!(regex_attr_content, r#"(?is)content\s*=\s*["']([^"']*)["']"#);
 static_regex!(
     regex_canonical,
     r#"(?is)<link\b[^>]*rel\s*=\s*["']canonical["'][^>]*href\s*=\s*["']([^"']+)["']"#
 );
-static_regex!(regex_html_lang, r#"(?is)<html\b[^>]*lang\s*=\s*["']([^"']+)["']"#);
+static_regex!(
+    regex_html_lang,
+    r#"(?is)<html\b[^>]*lang\s*=\s*["']([^"']+)["']"#
+);
 static_regex!(
     regex_strip_script_blocks,
     r#"(?is)<(script|style|noscript)\b[^>]*>.*?</(script|style|noscript)>"#
@@ -360,6 +431,18 @@ static_regex!(
 static_regex!(
     regex_anchor_text,
     r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#
+);
+// JSON hydration state carriers (Aletheia input). `<script type="application/
+// json">…</script>` covers Next.js (__NEXT_DATA__), Remix, SvelteKit, schema
+// blocks, and most modern frameworks; the assignment form covers Nuxt, Apollo,
+// and Redux, which attach state to a `window.__X__ = {…}` global.
+static_regex!(
+    regex_json_script,
+    r#"(?is)<script[^>]*type\s*=\s*["']application/json["'][^>]*>(.*?)</script>"#
+);
+static_regex!(
+    regex_state_assign,
+    r#"(?is)<script[^>]*>\s*(?:window\.)?(?:__NUXT__|__APOLLO_STATE__|__PRELOADED_STATE__|__INITIAL_STATE__|__NEXT_DATA__|__remixContext|__sveltekit[a-z0-9_]*)\s*=\s*(\{.*?\})\s*;?\s*</script>"#
 );
 
 fn extract_title(html: &str) -> Option<String> {
@@ -446,7 +529,11 @@ fn extract_json_ld_entities(html: &str) -> Vec<StructuredEntity> {
     out
 }
 
-fn collect_jsonld_entities(value: &serde_json::Value, depth: usize, out: &mut Vec<StructuredEntity>) {
+fn collect_jsonld_entities(
+    value: &serde_json::Value,
+    depth: usize,
+    out: &mut Vec<StructuredEntity>,
+) {
     if out.len() >= MAX_ENTITIES || depth > 6 {
         return;
     }
@@ -507,9 +594,7 @@ fn jsonld_type_string(value: &serde_json::Value) -> String {
 
 fn simplify_jsonld_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::String(s) => {
-            serde_json::Value::String(s.chars().take(600).collect())
-        }
+        serde_json::Value::String(s) => serde_json::Value::String(s.chars().take(600).collect()),
         serde_json::Value::Array(items) => {
             serde_json::Value::Array(items.iter().take(25).map(simplify_jsonld_value).collect())
         }
@@ -653,6 +738,50 @@ fn extract_pagination_links(html: &str, base_url: &Url) -> Vec<String> {
     out
 }
 
+/// Pull parseable JSON hydration-state blobs out of the page for Aletheia:
+/// every `<script type="application/json">` payload and every `window.__X__ =
+/// {…}` framework-state assignment. JSON-LD blocks are handled separately by
+/// the structured harvester, so they are skipped here. Bounded so a hostile
+/// page can't force unbounded parsing.
+fn extract_state_blobs(html: &str) -> Vec<serde_json::Value> {
+    const MAX_BLOBS: usize = 12;
+    const MAX_BLOB_BYTES: usize = 1_500_000;
+    let mut blobs = Vec::new();
+    let mut push = |raw: &str, blobs: &mut Vec<serde_json::Value>| {
+        let raw = raw.trim();
+        if raw.len() > MAX_BLOB_BYTES || raw.is_empty() {
+            return;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            if value.is_object() || value.is_array() {
+                blobs.push(value);
+            }
+        }
+    };
+    for caps in regex_json_script().captures_iter(html) {
+        if blobs.len() >= MAX_BLOBS {
+            break;
+        }
+        // Skip JSON-LD (application/ld+json), harvested by extract_structured.
+        let whole = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+        if whole.contains("ld+json") {
+            continue;
+        }
+        if let Some(body) = caps.get(1) {
+            push(body.as_str(), &mut blobs);
+        }
+    }
+    for caps in regex_state_assign().captures_iter(html) {
+        if blobs.len() >= MAX_BLOBS {
+            break;
+        }
+        if let Some(body) = caps.get(1) {
+            push(body.as_str(), &mut blobs);
+        }
+    }
+    blobs
+}
+
 fn extract_meta_content(html: &str, name: &str) -> Option<String> {
     for tag in regex_meta().find_iter(html) {
         let tag = tag.as_str();
@@ -721,7 +850,10 @@ fn extract_body_text(html: &str) -> String {
 
 fn strip_tags(raw: &str) -> String {
     let without_tags = regex_tag().replace_all(raw, " ");
-    without_tags.split_whitespace().collect::<Vec<_>>().join(" ")
+    without_tags
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Blocks loopback, RFC1918, link-local, CGNAT, unspecified, and IPv6
@@ -807,8 +939,14 @@ mod tests {
             Some("https://example.com/canonical")
         );
         assert_eq!(report.language.as_deref(), Some("en"));
-        assert_eq!(report.open_graph.get("og:title").map(String::as_str), Some("Hello OG"));
-        assert_eq!(report.open_graph.get("og:type").map(String::as_str), Some("article"));
+        assert_eq!(
+            report.open_graph.get("og:title").map(String::as_str),
+            Some("Hello OG")
+        );
+        assert_eq!(
+            report.open_graph.get("og:type").map(String::as_str),
+            Some("article")
+        );
         assert_eq!(report.json_ld_blocks, 1);
         assert_eq!(report.image_count, 1);
         assert_eq!(report.table_count, 1);
@@ -922,5 +1060,58 @@ mod tests {
         for host in ["93.184.216.34", "example.com", "8.8.8.8"] {
             assert!(!is_private_host(host), "{host} should be public");
         }
+    }
+
+    #[test]
+    fn renders_a_javascript_spa_from_hydration_state_without_js() {
+        // A single-page app: the DOM body is an empty mount point, and all the
+        // content lives in the Next.js __NEXT_DATA__ state blob. A plain DOM
+        // read sees nothing; Aletheia recovers the article.
+        let mut engine = SemanticRenderEngine::new();
+        let html = r##"<html lang="en"><head><title>App</title></head><body>
+          <div id="__next"></div>
+          <script id="__NEXT_DATA__" type="application/json">
+          {"props":{"pageProps":{"post":{
+             "headline":"Recovering Content Without a Browser",
+             "body":"This article was delivered as embedded hydration state, not as server rendered html, yet it was extracted with no javascript engine at all.",
+             "author":{"name":"Grace Hopper","id":"usr_2213"},
+             "__typename":"Post"}}},
+           "buildId":"b8f0a1c2d3e4"}
+          </script>
+          <script type="application/json">
+          {"feed":{"pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29yOjQw"}}}
+          </script>
+        </body></html>"##;
+        let report = engine
+            .render(SemanticRenderRequest {
+                url: "https://spa.example/post".into(),
+                html: html.into(),
+                content_type: "text/html".into(),
+                notarize_to_chain: false,
+            })
+            .expect("render should succeed");
+
+        // DOM body is essentially empty, but content was recovered from state.
+        assert!(report.word_count < 20, "DOM body should be near-empty");
+        assert!(
+            report.recovered.text.contains("embedded hydration state"),
+            "recovered text: {}",
+            report.recovered.text
+        );
+        assert!(report.recovered.recovered_chars > 80);
+        assert_eq!(report.recovered.state_blobs, 2);
+        // It's flagged as a JS-heavy page: nearly all meaning came from state.
+        assert!(report.recovered.js_content_ratio > 0.6);
+        // The pagination cursor is available for browser-free deep crawling…
+        assert!(
+            report
+                .recovered
+                .continuations
+                .iter()
+                .any(|c| c.kind == "relay_cursor" && c.value == "Y3Vyc29yOjQw")
+        );
+        // …and plumbing (build id, internal user id) is not treated as content.
+        assert!(!report.recovered.text.contains("b8f0a1c2d3e4"));
+        assert!(!report.recovered.text.contains("usr_2213"));
     }
 }

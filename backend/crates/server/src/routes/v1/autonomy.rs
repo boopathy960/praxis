@@ -43,11 +43,13 @@ async fn enqueue_job(
             "objective": job.objective,
         }),
     )?;
-    Ok(HttpResponse::Accepted().json(ApiResponse::ok(serde_json::json!({
-        "job": job,
-        "sandbox_receipt": sandbox,
-        "httpa_receipt": httpa_receipt,
-    }))))
+    Ok(
+        HttpResponse::Accepted().json(ApiResponse::ok(serde_json::json!({
+            "job": job,
+            "sandbox_receipt": sandbox,
+            "httpa_receipt": httpa_receipt,
+        }))),
+    )
 }
 
 async fn list_jobs(state: web::Data<AppState>) -> HttpResponse {

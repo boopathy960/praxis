@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["nucleus", "boot", "host", "pi"]
+# `boot` and `pi` are bare-metal binaries (x86_64-unknown-none /
+# aarch64-unknown-none); building them for the host triple can only fail.
+# Plain `cargo build` covers the host-buildable crates; the metal images are
+# built explicitly:
+#   cargo build -p praxis-boot --target x86_64-unknown-none
+#   cargo build -p praxis-pi   --target aarch64-unknown-none
+default-members = ["nucleus", "host"]
+# The disk-image builder wraps the kernel ELF in a bootable FAT image via the
+# `bootloader` crate, whose build script requires a NIGHTLY toolchain. Kept out
+# of the stable workspace so ordinary builds/tests never depend on it; run it
+# explicitly on a nightly host:  cd os/image && cargo +nightly run
+exclude = ["image"]
+
+# The bare-metal kernel has no unwinder; abort everywhere. Cargo ignores this
+# for test profiles, so `cargo test -p praxis-nucleus` still works on the host.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

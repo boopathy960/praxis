@@ -21,7 +21,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::Shared;
-use crate::agent_runtime::{AgentRuntimeService, CreateAgentExecutionRequest, FabricateAgentRequest};
+use crate::agent_runtime::{
+    AgentRuntimeService, CreateAgentExecutionRequest, FabricateAgentRequest,
+};
 use crate::chronicle::{ChronicleService, EpisodeKind, RecordEpisodeRequest};
 use crate::common::{AppError, TenantScope, new_id, now_ms};
 
@@ -125,7 +127,9 @@ impl AutonomyService {
             ));
         }
         if objective.len() > 2_048 {
-            return Err(AppError::Validation("autonomy objective is too long".into()));
+            return Err(AppError::Validation(
+                "autonomy objective is too long".into(),
+            ));
         }
         let mut store = self.store.write();
         if store.jobs.len() >= MAX_JOBS {
@@ -285,10 +289,12 @@ impl AutonomyService {
         objective: &str,
         tenant_scope: TenantScope,
     ) -> Result<ObjectiveOutcome, AppError> {
-        let fabrication = self.agent_runtime.fabricate_for_objective(FabricateAgentRequest {
-            tenant_scope,
-            objective: objective.to_string(),
-        })?;
+        let fabrication = self
+            .agent_runtime
+            .fabricate_for_objective(FabricateAgentRequest {
+                tenant_scope,
+                objective: objective.to_string(),
+            })?;
         // Empty requested_tools => the runtime uses the full fabricated
         // allowlist (deep_research, custom blueprint tool, file tools, ...).
         let receipt = self.agent_runtime.create_execution(
@@ -377,7 +383,9 @@ mod tests {
         assert!(done.execution_id.is_some());
         // The fabricated agent actually used the deep_research engine.
         assert!(
-            done.tools_used.iter().any(|tool| tool.contains("deep_research")),
+            done.tools_used
+                .iter()
+                .any(|tool| tool.contains("deep_research")),
             "expected deep_research in tools, got {:?}",
             done.tools_used
         );

@@ -37,9 +37,7 @@ async fn create_command(
         content_sample: Some(command.text.clone()),
         observed_at_ms: None,
     })?;
-    let response = state
-        .assistant_commands
-        .create_command(command, &dlp)?;
+    let response = state.assistant_commands.create_command(command, &dlp)?;
     let trace_id = new_id("httpa_trace");
     let orchestration =
         state

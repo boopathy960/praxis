@@ -140,7 +140,9 @@ impl SearxngClient {
 /// the network call so it can be unit-tested deterministically.
 pub fn parse_results(body: &str, count: usize) -> Result<Vec<WebSearchResult>, String> {
     let parsed: Value = serde_json::from_str(body).map_err(|error| {
-        format!("searxng response was not JSON: {error} (the instance may have JSON output disabled)")
+        format!(
+            "searxng response was not JSON: {error} (the instance may have JSON output disabled)"
+        )
     })?;
     let results = parsed
         .get("results")

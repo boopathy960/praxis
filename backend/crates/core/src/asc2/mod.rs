@@ -63,7 +63,6 @@ pub struct Asc2RuntimeConfig {
     pub remote_api_key: Option<String>,
     pub remote_model: String,
     pub openclaw_base_url: Option<String>,
-    pub auto_promote: bool,
 }
 
 impl Asc2RuntimeConfig {
@@ -76,7 +75,6 @@ impl Asc2RuntimeConfig {
             remote_model: env::var("ASTRA_ASC2_REMOTE_MODEL")
                 .unwrap_or_else(|_| "nvidia/nemotron-3-ultra-550b-a55b".into()),
             openclaw_base_url: nonempty_env("ASTRA_ASC2_OPENCLAW_BASE_URL"),
-            auto_promote: boolean_env("ASTRA_ASC2_AUTO_PROMOTE", false),
         }
     }
 }
@@ -488,7 +486,10 @@ pub struct Asc2Status {
     pub remote_configured: bool,
     pub remote_model: String,
     pub openclaw_baseline_configured: bool,
-    pub auto_promote: bool,
+    /// Who authorizes a binary self-modification to be promoted. Always
+    /// `"governance"` — the court's approval is the permission; there is no human
+    /// or env override.
+    pub self_modification_authority: String,
     pub total_missions: usize,
     pub total_benchmarks: usize,
     pub latest_benchmark_promotable: Option<bool>,
@@ -613,35 +614,11 @@ pub struct IdeationResult {
     pub created_at_ms: i64,
 }
 
-/// Request to run one self-evolution round toward a goal.
-#[derive(Debug, Clone, Deserialize)]
-pub struct EvolveRequest {
-    pub goal: String,
-    #[serde(default)]
-    pub candidates: usize,
-}
-
-/// The outcome of one self-evolution round: it *thinks* (ideation + adversarial
-/// critique), proposes the best survivor, and stops at the promotion gate. The
-/// `auto_promote` gate is *connected* (the loop reads and reports it) but, while
-/// closed, nothing is applied — a verified proposal is held for review.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvolutionOutcome {
-    pub evolution_id: String,
-    pub goal: String,
-    /// The full think+verify result.
-    pub thought: IdeationResult,
-    /// The best candidate that survived adversarial critique, if any.
-    pub proposed: Option<IdeaCandidate>,
-    /// The promotion path is wired into this loop (always true).
-    pub auto_promote_connected: bool,
-    /// The gate's state — `false` keeps it closed; nothing is applied.
-    pub auto_promote_open: bool,
-    /// True only if a change was actually applied (never while the gate is closed).
-    pub applied: bool,
-    pub decision: String,
-    pub created_at_ms: i64,
-}
+// Self-evolution now lives in the CEO (`crate::ceo`): it thinks, drafts an
+// upgrade or a concrete self-modification, and submits it to the governance
+// court for approval. ASC-II keeps only the primitives the CEO composes —
+// ideation (`autonomous_ideation`) and the self-modification draft/apply/stage
+// gauntlet (`draft_self_modification` / `apply_self_modification`).
 
 /// Request to assess the model's certainty on a question (Bucket-2 metacognition).
 #[derive(Debug, Clone, Deserialize)]
@@ -674,13 +651,15 @@ pub struct UncertaintyAssessment {
     pub note: String,
 }
 
-/// What the model returns when proposing an autonomous change.
-#[derive(Debug, Clone, Deserialize)]
-struct SelfModDraft {
-    path: String,
-    content: String,
+/// A concrete self-modification change: one file `path` (inside the boundary)
+/// set to `content`. The model proposes it; the court approves it; the gauntlet
+/// validates it. Public so the CEO can carry it in a governance proposal payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfModDraft {
+    pub path: String,
+    pub content: String,
     #[serde(default)]
-    rationale: Option<String>,
+    pub rationale: Option<String>,
 }
 
 #[derive(Clone)]
@@ -923,7 +902,7 @@ impl Asc2Service {
             remote_configured: self.remote.is_some(),
             remote_model: self.config.remote_model.clone(),
             openclaw_baseline_configured: self.config.openclaw_base_url.is_some(),
-            auto_promote: self.config.auto_promote,
+            self_modification_authority: "governance".into(),
             total_missions,
             total_benchmarks,
             latest_benchmark_promotable,
@@ -1036,9 +1015,15 @@ impl Asc2Service {
         .collect()
     }
 
+    /// Run the hardened gauntlet (real-diff allowlist, promotable benchmark,
+    /// fmt + full tests + release build, boot-canary) and stage the candidate
+    /// binary. `authorized` is the promotion permission — it is `true` ONLY when
+    /// the governance court has approved this change (passed down by the CEO).
+    /// When `false`, the candidate is validated and staged but never promoted.
     pub fn validate_and_stage_candidate(
         &self,
         candidate: SelfModificationCandidate,
+        authorized: bool,
     ) -> Result<SelfModificationRecord, AppError> {
         validate_changed_paths(&candidate.changed_paths)?;
         let workspace = PathBuf::from(&candidate.workspace_path);
@@ -1109,32 +1094,12 @@ impl Asc2Service {
             AppError::Internal(format!("failed to stage candidate server binary: {error}"))
         })?;
         let signed_hash = sha3_hex(&bytes);
-        let status = if self.config.auto_promote {
-            let manifest_path = self.data_dir.join("active_version.json");
-            // Build an N-deep rollback history: keep the prior history and push the
-            // binary we are replacing, so the supervisor can recover across more
-            // than one bad promotion (capped to bound disk + lookback).
-            const MAX_ROLLBACK_DEPTH: usize = 8;
-            let mut history = read_promotion_history(&manifest_path);
-            history.push(current_binary.to_string_lossy().into_owned());
-            if history.len() > MAX_ROLLBACK_DEPTH {
-                history.drain(0..history.len() - MAX_ROLLBACK_DEPTH);
-            }
-            let active_manifest = serde_json::json!({
-                "active_binary": promoted_binary.to_string_lossy(),
-                "previous_binaries": history,
-                "signature": signed_hash,
-                "promoted_at_ms": now_ms(),
-            });
-            fs::write(
-                &manifest_path,
-                serde_json::to_vec_pretty(&active_manifest).map_err(|error| {
-                    AppError::Internal(format!("promotion manifest serialization failed: {error}"))
-                })?,
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("failed to write active version manifest: {error}"))
-            })?;
+        // Promotion is reached only after every safety gate above has passed. The
+        // permission to actually promote is `authorized` — granted ONLY by the
+        // governance court's approval (the CEO passes it down). When not
+        // authorized, the binary is staged on disk and HELD as "validated".
+        let status = if authorized {
+            self.promote_active_version(&promoted_binary, &current_binary, &signed_hash)?;
             "promoted"
         } else {
             "validated"
@@ -1158,6 +1123,46 @@ impl Asc2Service {
         Ok(record)
     }
 
+    /// Promote a staged candidate to the active binary — the autonomous binary
+    /// swap that opening `ASTRA_ASC2_AUTO_PROMOTE` enables. Rewrites
+    /// `active_version.json` to point at the new binary and pushes the binary it
+    /// replaces onto a bounded rollback history the supervisor can recover across.
+    /// Extracted so the promotion effect is unit-testable on its own, without the
+    /// build/test/canary gauntlet that (correctly) stands in front of it at runtime.
+    fn promote_active_version(
+        &self,
+        promoted_binary: &Path,
+        current_binary: &Path,
+        signed_hash: &str,
+    ) -> Result<(), AppError> {
+        let manifest_path = self.data_dir.join("active_version.json");
+        // Build an N-deep rollback history: keep the prior history and push the
+        // binary we are replacing, so the supervisor can recover across more than
+        // one bad promotion (capped to bound disk + lookback).
+        const MAX_ROLLBACK_DEPTH: usize = 8;
+        let mut history = read_promotion_history(&manifest_path);
+        history.push(current_binary.to_string_lossy().into_owned());
+        if history.len() > MAX_ROLLBACK_DEPTH {
+            history.drain(0..history.len() - MAX_ROLLBACK_DEPTH);
+        }
+        let active_manifest = serde_json::json!({
+            "active_binary": promoted_binary.to_string_lossy(),
+            "previous_binaries": history,
+            "signature": signed_hash,
+            "promoted_at_ms": now_ms(),
+        });
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&active_manifest).map_err(|error| {
+                AppError::Internal(format!("promotion manifest serialization failed: {error}"))
+            })?,
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("failed to write active version manifest: {error}"))
+        })?;
+        Ok(())
+    }
+
     /// The autonomous self-modification loop: the model proposes ONE change to a
     /// file inside the self-modification boundary, the change is applied to the
     /// workspace, and it is driven through the full hardened pipeline
@@ -1167,22 +1172,22 @@ impl Asc2Service {
     /// reverted so the workspace is left clean — the model never gets to keep an
     /// unproven edit. Promotion happens only when every gate passes and
     /// `ASTRA_ASC2_AUTO_PROMOTE=true`.
-    pub async fn autonomous_self_modification(
-        &self,
-        request: AutonomousSelfModRequest,
-    ) -> Result<AutonomousSelfModOutcome, AppError> {
+    /// Ask the model to propose ONE bounded self-modification change for `goal`,
+    /// validated to sit inside the self-modification boundary. Returns the draft
+    /// WITHOUT applying it — the CEO turns this into a governance proposal so the
+    /// court approves the *concrete* change before anything is built or promoted.
+    pub async fn draft_self_modification(&self, goal: &str) -> Result<SelfModDraft, AppError> {
         let reasoner = self.remote.clone().ok_or_else(|| {
             AppError::Validation(
-                "no remote model is configured for autonomous self-modification".into(),
+                "no remote model is configured for self-modification drafting".into(),
             )
         })?;
-        let goal = request.goal.trim().to_string();
+        let goal = goal.trim().to_string();
         if goal.is_empty() {
             return Err(AppError::Validation(
-                "autonomous self-modification goal is empty".into(),
+                "self-modification goal is empty".into(),
             ));
         }
-        // 1) The model proposes a single bounded change.
         let raw = reasoner
             .complete(
                 autonomous_self_mod_system_prompt(),
@@ -1200,24 +1205,56 @@ impl Asc2Service {
                 draft.path
             )));
         }
-        // 2) Apply + drive the hardened pipeline off the async pool (cargo and the
-        //    canary are blocking + process-spawning).
+        Ok(draft)
+    }
+
+    /// Apply a self-modification draft and drive it through the hardened gauntlet
+    /// off the async pool (cargo + canary are blocking). `authorized` is the
+    /// governance promotion permission — the CEO passes `true` only after the
+    /// court approves. The change is reverted if any gate rejects it.
+    pub async fn apply_self_modification(
+        &self,
+        request: AutonomousSelfModRequest,
+        draft: SelfModDraft,
+        authorized: bool,
+    ) -> Result<AutonomousSelfModOutcome, AppError> {
+        if !path_within_self_mod_boundary(&draft.path) {
+            return Err(AppError::Forbidden(format!(
+                "proposed path is outside the self-modification boundary: {}",
+                draft.path
+            )));
+        }
         let service = self.clone();
-        actix_web::web::block(move || service.apply_and_stage_proposal(request, goal, draft))
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("autonomous self-modification task failed: {error}"))
-            })?
+        let goal = request.goal.trim().to_string();
+        actix_web::web::block(move || {
+            service.apply_and_stage_proposal(request, goal, draft, authorized)
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("self-modification task failed: {error}")))?
+    }
+
+    /// The direct admin self-modification entry: the model proposes a change and
+    /// it runs through the gauntlet, but it is NEVER promoted here — a human/admin
+    /// can stage and inspect, but only the governance court (via the CEO) can
+    /// authorize promotion. Hence `authorized = false` always.
+    pub async fn autonomous_self_modification(
+        &self,
+        request: AutonomousSelfModRequest,
+    ) -> Result<AutonomousSelfModOutcome, AppError> {
+        let draft = self.draft_self_modification(&request.goal).await?;
+        self.apply_self_modification(request, draft, false).await
     }
 
     /// Write the proposed change, run the hardened validation/promotion pipeline,
     /// and revert the change if any gate rejects it (so a rejected proposal never
-    /// lingers in the workspace).
+    /// lingers in the workspace). `authorized` is passed straight to the staging
+    /// gate as the promotion permission.
     fn apply_and_stage_proposal(
         &self,
         request: AutonomousSelfModRequest,
         goal: String,
         draft: SelfModDraft,
+        authorized: bool,
     ) -> Result<AutonomousSelfModOutcome, AppError> {
         let workspace = PathBuf::from(&request.workspace_path);
         if !workspace.is_dir() {
@@ -1236,11 +1273,14 @@ impl Asc2Service {
             AppError::Internal(format!("failed to write proposed change: {error}"))
         })?;
 
-        let staged = self.validate_and_stage_candidate(SelfModificationCandidate {
-            workspace_path: request.workspace_path.clone(),
-            changed_paths: vec![draft.path.clone()],
-            current_binary: request.current_binary.clone(),
-        });
+        let staged = self.validate_and_stage_candidate(
+            SelfModificationCandidate {
+                workspace_path: request.workspace_path.clone(),
+                changed_paths: vec![draft.path.clone()],
+                current_binary: request.current_binary.clone(),
+            },
+            authorized,
+        );
 
         match staged {
             Ok(record) => Ok(AutonomousSelfModOutcome {
@@ -1432,52 +1472,6 @@ impl Asc2Service {
         Ok(result)
     }
 
-    /// One self-evolution round: think (ideation + adversarial critique), propose
-    /// the best survivor, and stop at the promotion gate. `auto_promote` is
-    /// *connected* here but governs whether anything is applied — while it is
-    /// closed (the default) a verified proposal is only recorded for review. Even
-    /// with the gate open, free-form proposals are never auto-applied; a concrete
-    /// change must still travel the gated `/asc2/self-modifications` path.
-    pub async fn self_evolve(&self, request: EvolveRequest) -> Result<EvolutionOutcome, AppError> {
-        let reasoner = self.remote.clone().ok_or_else(|| {
-            AppError::Validation("no remote model is configured for self-evolution".into())
-        })?;
-        let thought = run_ideation(
-            &reasoner,
-            &IdeationRequest {
-                problem: request.goal.clone(),
-                candidates: request.candidates,
-            },
-        )
-        .await?;
-        let proposed = thought
-            .candidates
-            .iter()
-            .find(|c| c.score >= IDEATION_SURVIVAL_THRESHOLD)
-            .cloned();
-        let gate_open = self.config.auto_promote;
-        let (applied, decision) = evolution_decision(proposed.as_ref(), gate_open);
-        let outcome = EvolutionOutcome {
-            evolution_id: new_id("asc2_evolution"),
-            goal: request.goal,
-            thought,
-            proposed,
-            auto_promote_connected: true,
-            auto_promote_open: gate_open,
-            applied,
-            decision,
-            created_at_ms: now_ms(),
-        };
-        persist_json(
-            &self.store,
-            "asc2_evolutions",
-            "evolution_id",
-            &outcome.evolution_id,
-            &outcome,
-        )?;
-        Ok(outcome)
-    }
-
     /// Metacognition (Bucket 2): assess the model's certainty on a question via
     /// self-consistency — answer it several ways, measure agreement, surface the
     /// known-unknowns, and abstain when it is not answerable. Honest by design:
@@ -1627,34 +1621,6 @@ fn consensus(finals: &[String]) -> (String, f64, Vec<String>) {
     let mut distinct: Vec<String> = groups.into_values().map(|(_, rep)| rep).collect();
     distinct.sort();
     (representative, agreement, distinct)
-}
-
-/// The promotion-gate decision for a self-evolution round. The gate is connected
-/// here, but a free-form proposal is NEVER auto-applied — even with the gate open,
-/// a concrete change must travel the gated self-modification path. So `applied`
-/// is always `false`; this function only produces the human-readable decision.
-fn evolution_decision(proposed: Option<&IdeaCandidate>, gate_open: bool) -> (bool, String) {
-    match (proposed, gate_open) {
-        (None, _) => (
-            false,
-            "no candidate survived adversarial review — nothing to evolve this round".to_string(),
-        ),
-        (Some(c), false) => (
-            false,
-            format!(
-                "proposed '{}' — HELD FOR REVIEW (auto_promote gate is CLOSED; nothing applied)",
-                c.title
-            ),
-        ),
-        (Some(c), true) => (
-            false,
-            format!(
-                "proposed '{}' — auto_promote is OPEN, but free-form proposals are never \
-                 auto-applied; route a concrete change through /asc2/self-modifications",
-                c.title
-            ),
-        ),
-    }
 }
 
 const IDEATION_GEN_SYSTEM: &str = "You are an ideation engine. Given a problem, propose DISTINCT, \
@@ -2274,12 +2240,42 @@ fn enforce_actual_changes_within_allowlist(workspace: &Path) -> Result<(), AppEr
             "self-modification workspace has no changes to validate".into(),
         ));
     }
+    // Layer 0 (backstop) — the off-limits path ban, re-checked here against the
+    // ACTUAL git diff. Redundant with the allowlist below by design: an
+    // independent hard wall so the guards can never appear in a change set.
+    if let Some(path) = changed
+        .iter()
+        .find(|p| crate::governance::self_mod_path_forbidden(p))
+    {
+        return Err(AppError::Forbidden(format!(
+            "self-modification touches a banned subsystem (governance/sandbox/supervisor): {path}"
+        )));
+    }
+    // Layer 3 — the build-time supply-chain lock. A change to build.rs,
+    // Cargo.toml, or Cargo.lock could pull a dependency or run arbitrary code at
+    // COMPILE time, downloading a payload the source review never saw. Aborted
+    // before the build runs.
+    if let Some(path) = changed.iter().find(|p| touches_build_or_dependencies(p)) {
+        return Err(AppError::Forbidden(format!(
+            "self-modification changes build/dependency files ({path}) — refused to block \
+             supply-chain injection (no new deps, no build scripts)"
+        )));
+    }
+    // The primary boundary: the changed-path allowlist.
     if let Some(path) = changed.iter().find(|p| !path_within_self_mod_boundary(p)) {
         return Err(AppError::Forbidden(format!(
             "self-modification workspace changes a file outside the allowed boundary: {path}"
         )));
     }
     Ok(())
+}
+
+/// True if `path` is a build script or a dependency manifest/lockfile — the
+/// supply-chain surface the build-time lock (Layer 3) refuses.
+fn touches_build_or_dependencies(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_lowercase();
+    let leaf = p.rsplit('/').next().unwrap_or(&p);
+    matches!(leaf, "build.rs" | "cargo.toml" | "cargo.lock")
 }
 
 /// The set of paths that differ from HEAD (modified, added, untracked, renamed),
@@ -2842,6 +2838,62 @@ data: [DONE]";
     }
 
     #[test]
+    fn self_modification_backstops_reject_banned_paths_and_build_changes() {
+        // Layers 0 (path ban backstop) and 3 (build-time supply-chain lock),
+        // checked against the real git diff in the gauntlet.
+        let git_repo = |label: &str| {
+            let dir = std::env::temp_dir().join(new_id(label));
+            std::fs::create_dir_all(&dir).unwrap();
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["init"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                for cfg in [
+                    ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"],
+                ] {
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&dir)
+                        .args(cfg)
+                        .output();
+                }
+            }
+            (dir, ok)
+        };
+
+        // Layer 0 — a change under governance/ source is rejected as banned.
+        let (dir, ok) = git_repo("asc2_ban");
+        if !ok {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // git unavailable — skip
+        }
+        std::fs::create_dir_all(dir.join("crates/core/src/governance")).unwrap();
+        std::fs::write(dir.join("crates/core/src/governance/mod.rs"), "fn x(){}").unwrap();
+        let err = enforce_actual_changes_within_allowlist(&dir).unwrap_err();
+        assert!(format!("{err:?}").contains("banned subsystem"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Layer 3 — a Cargo.toml change is rejected (supply chain).
+        let (dir, _) = git_repo("asc2_dep");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let err = enforce_actual_changes_within_allowlist(&dir).unwrap_err();
+        assert!(format!("{err:?}").contains("supply-chain"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Layer 3 — a build.rs change is rejected (compile-time code execution).
+        let (dir, _) = git_repo("asc2_buildrs");
+        std::fs::write(dir.join("build.rs"), "fn main(){}").unwrap();
+        let err = enforce_actual_changes_within_allowlist(&dir).unwrap_err();
+        assert!(format!("{err:?}").contains("supply-chain"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn autonomous_apply_reverts_a_proposal_rejected_by_a_gate() {
         // Drives the loop's apply->validate->revert logic deterministically (no
         // model needed): a boundary-valid proposal is written, the pipeline
@@ -2881,8 +2933,10 @@ data: [DONE]";
                 .into_owned(),
         };
 
+        // Even with governance authorization (true), the gauntlet still rejects
+        // (no promotable benchmark in a fresh service) and the change is reverted.
         let outcome = service
-            .apply_and_stage_proposal(request, "improve a prompt".into(), draft)
+            .apply_and_stage_proposal(request, "improve a prompt".into(), draft, true)
             .expect("outcome");
 
         // Rejected at the benchmark gate, not promoted, and the proposal reverted.
@@ -2898,6 +2952,46 @@ data: [DONE]";
             "proposed file must be reverted"
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn auto_promote_writes_active_version_manifest_with_rollback_history() {
+        // Pins EXACTLY what opening ASTRA_ASC2_AUTO_PROMOTE does once a candidate
+        // has cleared the gauntlet: rewrite active_version.json to point at the
+        // staged binary and record the replaced one for rollback. The supervisor
+        // watches this manifest and swaps to `active_binary`.
+        let service = test_service("promote");
+        let cur = std::env::current_exe().unwrap();
+        let v1 = service.data_dir.join("versions").join("astra-server-v1");
+        let manifest_path = service.data_dir.join("active_version.json");
+
+        service
+            .promote_active_version(&v1, &cur, "hash-v1")
+            .expect("promote v1");
+        let m1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            m1["active_binary"].as_str().unwrap(),
+            v1.to_string_lossy().as_ref()
+        );
+        assert_eq!(m1["signature"], "hash-v1");
+
+        // A second promotion repoints at v2 and pushes v1 onto the rollback chain.
+        let v2 = service.data_dir.join("versions").join("astra-server-v2");
+        service
+            .promote_active_version(&v2, &v1, "hash-v2")
+            .expect("promote v2");
+        let m2: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            m2["active_binary"].as_str().unwrap(),
+            v2.to_string_lossy().as_ref()
+        );
+        let history: Vec<String> = serde_json::from_value(m2["previous_binaries"].clone()).unwrap();
+        assert!(
+            history.iter().any(|p| p.ends_with("astra-server-v1")),
+            "the replaced binary must be recorded for rollback: {history:?}"
+        );
     }
 
     #[test]
@@ -2963,28 +3057,6 @@ data: [DONE]";
             parse_idea_candidates("1. Title: A\nx\n2. Title: B\ny", 5).len(),
             2
         );
-    }
-
-    #[test]
-    fn self_evolution_holds_at_the_promotion_gate() {
-        let candidate = IdeaCandidate {
-            title: "improve caching".into(),
-            approach: "add an LRU cache".into(),
-            score: 0.9,
-            verdict: "viable".into(),
-            critique: "solid".into(),
-        };
-        // Gate CLOSED: a survivor is held for review, nothing applied.
-        let (applied, why) = evolution_decision(Some(&candidate), false);
-        assert!(!applied);
-        assert!(why.contains("CLOSED"));
-        // Gate OPEN: STILL not applied — free-form proposals are never auto-applied.
-        let (applied_open, why_open) = evolution_decision(Some(&candidate), true);
-        assert!(!applied_open);
-        assert!(why_open.contains("OPEN"));
-        // No survivor: nothing to evolve.
-        let (applied_none, _) = evolution_decision(None, false);
-        assert!(!applied_none);
     }
 
     #[actix_web::test]

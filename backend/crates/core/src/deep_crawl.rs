@@ -68,6 +68,12 @@ pub struct CrawledPage {
     /// Harvested machine-readable records: schema.org entities, tables as
     /// rows, and detected pagination — the deep data-collection payload.
     pub structured: crate::semantic_render::ExtractedData,
+    /// Share of this page's meaning that lived only in JavaScript state, in
+    /// `[0,1]` — high means it was a single-page app recovered by Aletheia.
+    pub js_content_ratio: f64,
+    /// Whether the page's content was recovered from JS hydration state
+    /// (Aletheia) rather than read from the DOM — a browser-free SPA render.
+    pub recovered_from_state: bool,
 }
 
 /// The engine. Holds a shared handle to the renderer and shares the device
@@ -259,7 +265,9 @@ impl DeepCrawlEngine {
             std::collections::BTreeMap::new();
         for page in &pages {
             for entity in &page.structured.entities {
-                *type_histogram.entry(entity.entity_type.clone()).or_insert(0) += 1;
+                *type_histogram
+                    .entry(entity.entity_type.clone())
+                    .or_insert(0) += 1;
                 if all_entities.len() < 200 {
                     all_entities.push(json!({
                         "type": entity.entity_type,
@@ -289,6 +297,21 @@ impl DeepCrawlEngine {
             "tables": all_tables,
         });
 
+        // Surface the Aletheia recovery so an agent can see which pages were
+        // JavaScript single-page apps rendered without a browser, and how
+        // JS-heavy the crawl was overall.
+        let js_recovered_pages = pages.iter().filter(|p| p.recovered_from_state).count();
+        let peak_js_ratio = pages
+            .iter()
+            .map(|p| p.js_content_ratio)
+            .fold(0.0_f64, f64::max);
+        let js_recovery = json!({
+            "pages_recovered_from_js_state": js_recovered_pages,
+            "peak_js_content_ratio": peak_js_ratio,
+            "note": "pages whose content lived only in JavaScript hydration state, \
+                     recovered by the Aletheia engine without executing any JavaScript",
+        });
+
         Ok(json!({
             "tool": "deep_crawl",
             "crawl_id": trace_id,
@@ -302,10 +325,11 @@ impl DeepCrawlEngine {
             "pages": pages,
             "top_findings": top_findings,
             "dataset": dataset,
+            "js_recovery": js_recovery,
             "pipeline": if seed_source == "searxng" {
-                "searxng_discovery -> safe_fetch -> semantic_render -> harvest_structured -> link_crawl -> relevance_rank"
+                "searxng_discovery -> safe_fetch -> semantic_render -> aletheia_recover -> harvest_structured -> link_crawl -> relevance_rank"
             } else {
-                "safe_fetch -> semantic_render -> harvest_structured -> link_crawl -> relevance_rank"
+                "safe_fetch -> semantic_render -> aletheia_recover -> harvest_structured -> link_crawl -> relevance_rank"
             },
         }))
     }
@@ -337,7 +361,12 @@ impl DeepCrawlEngine {
             })
             .map_err(|e| format!("semantic render failed: {e}"))?;
 
-        // 3. Relevance scoring against the query.
+        // 3. Relevance scoring against the query. On a JavaScript SPA the DOM
+        // body is near-empty, so fold in the content Aletheia recovered from
+        // the hydration state — otherwise a browser-rendered page scores zero.
+        let recovered = &report.recovered;
+        let dom_thin = report.word_count < 50;
+        let recovered_from_state = dom_thin && recovered.recovered_chars > 0;
         let mut scored_text = report.text_excerpt.clone();
         for heading in &report.headings {
             scored_text.push(' ');
@@ -347,33 +376,72 @@ impl DeepCrawlEngine {
             scored_text.push(' ');
             scored_text.push_str(title);
         }
+        if recovered_from_state {
+            scored_text.push(' ');
+            scored_text.push_str(&recovered.text);
+        }
         let relevance = relevance_score(query_tokens, &scored_text);
 
-        // Pagination links lead first so deep multi-page collection (a paged
-        // product/search listing) is followed before unrelated outbound links.
-        let mut links = report.structured.pagination_links.clone();
+        // Frontier order: state-derived continuations (browser-free "next page"
+        // of a feed/listing) first, then DOM pagination, then outbound links —
+        // so deep multi-page collection is followed before wandering off.
+        let mut links: Vec<String> = Vec::new();
+        for cont in &recovered.continuations {
+            // Only URL-shaped continuations can be fetched directly; cursors and
+            // offset params need an API endpoint the crawler doesn't infer here.
+            if cont.kind == "next_url" {
+                if let Ok(resolved) =
+                    url::Url::parse(&report.normalized_url).and_then(|base| base.join(&cont.value))
+                {
+                    if matches!(resolved.scheme(), "http" | "https") {
+                        let resolved = resolved.to_string();
+                        if !links.contains(&resolved) {
+                            links.push(resolved);
+                        }
+                    }
+                }
+            }
+        }
+        for link in &report.structured.pagination_links {
+            if !links.contains(link) {
+                links.push(link.clone());
+            }
+        }
         for link in &report.links {
             if !links.contains(link) {
                 links.push(link.clone());
             }
         }
+        // On a thin-DOM SPA, use the recovered content as the readable excerpt.
+        let text_excerpt = if recovered_from_state {
+            recovered.text.chars().take(480).collect()
+        } else {
+            report.text_excerpt.clone()
+        };
+        let word_count = if recovered_from_state {
+            recovered.text.split_whitespace().count()
+        } else {
+            report.word_count
+        };
         let page = CrawledPage {
             url: report.normalized_url.clone(),
             domain: domain_of(&report.normalized_url),
             depth,
             title: report.title.clone(),
             relevance,
-            word_count: report.word_count,
+            word_count,
             reading_time_minutes: report.reading_time_minutes,
             headings: report.headings.iter().take(12).cloned().collect(),
             outbound_links: report.links.len(),
-            text_excerpt: report.text_excerpt.clone(),
+            text_excerpt,
             render_proof_hash: report.proof_hash.clone(),
             content_hash: report.content_hash.clone(),
             script_count: report.script_count,
             iframe_count: report.iframe_count,
             inline_event_handlers: report.inline_event_handlers,
             structured: report.structured.clone(),
+            js_content_ratio: recovered.js_content_ratio,
+            recovered_from_state,
         };
         Ok((page, links))
     }
@@ -464,7 +532,10 @@ mod tests {
         assert_eq!(seeds.len(), 2);
         // Non-http schemes and dups are rejected.
         let v2 = json!({ "urls": ["ftp://x", "https://a.example", "https://a.example"] });
-        assert_eq!(collect_seed_urls(&v2), vec!["https://a.example".to_string()]);
+        assert_eq!(
+            collect_seed_urls(&v2),
+            vec!["https://a.example".to_string()]
+        );
     }
 
     #[test]

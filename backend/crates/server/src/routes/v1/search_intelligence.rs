@@ -31,7 +31,9 @@ async fn search_intelligence(
     let request = body.into_inner();
     let response = web::block(move || service.execute(request))
         .await
-        .map_err(|error| AppError::Internal(format!("search intelligence task failed: {error}")))??;
+        .map_err(|error| {
+            AppError::Internal(format!("search intelligence task failed: {error}"))
+        })??;
     let sandbox = state.sandbox.guard(
         state.sandbox.action_for_activity(
             "search_intelligence",

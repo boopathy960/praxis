@@ -32,9 +32,7 @@ async fn live(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
 
 /// Recent sealed, hash-chained records of finished device operations.
 async fn audit(state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(ApiResponse::ok(
-        state.device.supervisor().recent_audit(200),
-    )))
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(state.device.supervisor().recent_audit(200))))
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,9 +53,7 @@ async fn execute(
     // The shell path can block for the full command timeout, so run it off the
     // actix worker pool.
     let result = astra_core::common::run_blocking_io(move || {
-        device
-            .execute(&tool, &input)
-            .map_err(AppError::Validation)
+        device.execute(&tool, &input).map_err(AppError::Validation)
     })?;
     Ok(HttpResponse::Ok().json(ApiResponse::ok(result)))
 }

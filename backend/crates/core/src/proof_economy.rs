@@ -30,12 +30,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 use crate::common::{AppError, new_id, now_ms};
 use crate::device_agent::DeviceCapabilities;
 pub use crate::verification::Check;
+use parking_lot::Mutex;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 const BASE_REPUTATION: f64 = 100.0;
 const PROPOSE_STAKE: f64 = 10.0;
@@ -173,7 +173,10 @@ pub struct ProofEconomy {
 }
 
 impl ProofEconomy {
-    pub fn new(data_dir: impl AsRef<Path>, device: Arc<DeviceCapabilities>) -> Result<Self, AppError> {
+    pub fn new(
+        data_dir: impl AsRef<Path>,
+        device: Arc<DeviceCapabilities>,
+    ) -> Result<Self, AppError> {
         let path = data_dir.as_ref().join("proof_economy.sqlite");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -222,7 +225,12 @@ impl ProofEconomy {
             return Err(AppError::Validation("claim statement is empty".into()));
         }
         let reversible = request.verification.is_reversible();
-        let stake = PROPOSE_STAKE * if reversible { 1.0 } else { IRREVERSIBLE_STAKE_MULT };
+        let stake = PROPOSE_STAKE
+            * if reversible {
+                1.0
+            } else {
+                IRREVERSIBLE_STAKE_MULT
+            };
 
         let mut proposer = self.account_or_fresh(&request.proposer);
         if proposer.bankrupt() {
@@ -318,7 +326,8 @@ impl ProofEconomy {
             if counter_holds {
                 // Both the claim and a contradicting check pass — freeze it.
                 claim.status = ClaimStatus::Disputed;
-                claim.last_verification = format!("disputed: counter-check also passes ({cdetail})");
+                claim.last_verification =
+                    format!("disputed: counter-check also passes ({cdetail})");
                 attacker.reputation += ATTACK_STAKE; // genuine dispute is refunded
                 claim.attacks.push(Attack {
                     attacker: request.attacker,
@@ -391,12 +400,22 @@ impl ProofEconomy {
         self.claims_by_status("proposed")
     }
 
+    /// Refuted claims — facts the world contradicted. Used by [Noēsis]
+    /// (crate::noesis) as the negative half of its training corpus, so a theory
+    /// must discriminate what holds from what fails, not just echo "everything
+    /// is true".
+    pub fn refuted_claims(&self) -> Result<Vec<Claim>, AppError> {
+        self.claims_by_status("refuted")
+    }
+
     /// Value-of-information experiment selection: the open claim where resolving
     /// uncertainty is worth the most per unit of verification cost.
     pub fn next_experiment(&self) -> Result<Option<Claim>, AppError> {
         let open = self.open_claims()?;
         Ok(open.into_iter().max_by(|a, b| {
-            voi(a).partial_cmp(&voi(b)).unwrap_or(std::cmp::Ordering::Equal)
+            voi(a)
+                .partial_cmp(&voi(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
         }))
     }
 
@@ -571,9 +590,24 @@ mod tests {
         assert_eq!(claim.status, ClaimStatus::Proposed);
 
         // Two failed attacks (the claim is actually true) → mint.
-        econ.attack(&claim.claim_id, AttackRequest { attacker: "bob".into(), note: "nope".into(), counter: None }).unwrap();
+        econ.attack(
+            &claim.claim_id,
+            AttackRequest {
+                attacker: "bob".into(),
+                note: "nope".into(),
+                counter: None,
+            },
+        )
+        .unwrap();
         let minted = econ
-            .attack(&claim.claim_id, AttackRequest { attacker: "carol".into(), note: "nope".into(), counter: None })
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "carol".into(),
+                    note: "nope".into(),
+                    counter: None,
+                },
+            )
             .unwrap();
         assert_eq!(minted.status, ClaimStatus::Minted);
         assert_eq!(minted.survived_attacks, 2);
@@ -624,7 +658,10 @@ mod tests {
                 statement: "fact.txt says the sky is blue".into(),
                 kind: ClaimKind::Assertion,
                 proposer: "alice".into(),
-                verification: Check::FileContains { path: path.clone(), substring: "blue".into() },
+                verification: Check::FileContains {
+                    path: path.clone(),
+                    substring: "blue".into(),
+                },
                 evidence: vec![],
                 depends_on: vec![],
             })
@@ -634,7 +671,14 @@ mod tests {
         // Reality moves: the file changes. Now an attack falsifies the claim.
         std::fs::write(&file, "the sky is green").unwrap();
         let refuted = econ
-            .attack(&claim.claim_id, AttackRequest { attacker: "bob".into(), note: "file changed".into(), counter: None })
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "bob".into(),
+                    note: "file changed".into(),
+                    counter: None,
+                },
+            )
             .unwrap();
         assert_eq!(refuted.status, ClaimStatus::Refuted);
         // Proposer's stake transferred to the successful attacker.
@@ -660,9 +704,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Proposed);
-        econ.attack(&claim.claim_id, AttackRequest { attacker: "skeptic1".into(), note: "".into(), counter: None }).unwrap();
+        econ.attack(
+            &claim.claim_id,
+            AttackRequest {
+                attacker: "skeptic1".into(),
+                note: "".into(),
+                counter: None,
+            },
+        )
+        .unwrap();
         let minted = econ
-            .attack(&claim.claim_id, AttackRequest { attacker: "skeptic2".into(), note: "".into(), counter: None })
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "skeptic2".into(),
+                    note: "".into(),
+                    counter: None,
+                },
+            )
             .unwrap();
         assert_eq!(minted.kind, ClaimKind::Impossibility);
         assert_eq!(minted.status, ClaimStatus::Minted);
@@ -683,7 +742,11 @@ mod tests {
             });
         }
         let acct = econ.account("reckless").unwrap();
-        assert!(acct.bankrupt(), "reputation should be exhausted, got {}", acct.reputation);
+        assert!(
+            acct.bankrupt(),
+            "reputation should be exhausted, got {}",
+            acct.reputation
+        );
         let blocked = econ.propose(ProposeRequest {
             statement: "one more".into(),
             kind: ClaimKind::Assertion,
@@ -692,6 +755,9 @@ mod tests {
             evidence: vec![],
             depends_on: vec![],
         });
-        assert!(blocked.is_err(), "bankrupt agent must be blocked from proposing");
+        assert!(
+            blocked.is_err(),
+            "bankrupt agent must be blocked from proposing"
+        );
     }
 }

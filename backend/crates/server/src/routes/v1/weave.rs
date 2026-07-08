@@ -69,11 +69,13 @@ async fn submit_intent(
             "execution_id": intent.execution_id,
         }),
     )?;
-    Ok(HttpResponse::Created().json(ApiResponse::ok(serde_json::json!({
-        "intent": intent,
-        "sandbox_receipt": sandbox,
-        "httpa_receipt": httpa_receipt,
-    }))))
+    Ok(
+        HttpResponse::Created().json(ApiResponse::ok(serde_json::json!({
+            "intent": intent,
+            "sandbox_receipt": sandbox,
+            "httpa_receipt": httpa_receipt,
+        }))),
+    )
 }
 
 async fn list_intents(state: web::Data<AppState>) -> HttpResponse {

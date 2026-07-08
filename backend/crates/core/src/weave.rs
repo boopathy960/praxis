@@ -26,7 +26,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::Shared;
-use crate::agent_runtime::{AgentRuntimeService, CreateAgentExecutionRequest, FabricateAgentRequest};
+use crate::agent_runtime::{
+    AgentRuntimeService, CreateAgentExecutionRequest, FabricateAgentRequest,
+};
 use crate::autonomy::{AutonomyService, EnqueueJobRequest};
 use crate::chronicle::{ChronicleService, EpisodeKind, RecordEpisodeRequest};
 use crate::common::{AppError, TenantScope, new_id, now_ms};
@@ -220,7 +222,9 @@ impl WeaveService {
             ));
         }
         if description.len() > MAX_DESCRIPTION_LEN {
-            return Err(AppError::Validation("weave intent description is too long".into()));
+            return Err(AppError::Validation(
+                "weave intent description is too long".into(),
+            ));
         }
         let lower = description.to_ascii_lowercase();
         // Money-earning features were deliberately removed from this project;
@@ -228,8 +232,16 @@ impl WeaveService {
         if contains_any(
             &lower,
             &[
-                "trading", "earn money", "make money", "profit", "invest in", "investment",
-                "investing", "gambling", "bet on", "passive income",
+                "trading",
+                "earn money",
+                "make money",
+                "profit",
+                "invest in",
+                "investment",
+                "investing",
+                "gambling",
+                "bet on",
+                "passive income",
             ],
         ) {
             return Err(AppError::Validation(
@@ -413,10 +425,12 @@ impl WeaveService {
         description: &str,
         tenant_scope: TenantScope,
     ) -> Result<Materialization, AppError> {
-        let fabrication = self.agent_runtime.fabricate_for_objective(FabricateAgentRequest {
-            tenant_scope,
-            objective: description.to_string(),
-        })?;
+        let fabrication = self
+            .agent_runtime
+            .fabricate_for_objective(FabricateAgentRequest {
+                tenant_scope,
+                objective: description.to_string(),
+            })?;
         let fabricated_tools = fabrication
             .tools
             .iter()
@@ -472,15 +486,59 @@ struct Materialization {
 /// Deterministic intent classification from keyword groups. Order matters:
 /// more specific intents are checked before the broad fallbacks.
 fn classify_intent(lower: &str) -> IntentKind {
-    if contains_any(lower, &["monitor", "watch", "alert", "notify", "track changes", "keep an eye"]) {
+    if contains_any(
+        lower,
+        &[
+            "monitor",
+            "watch",
+            "alert",
+            "notify",
+            "track changes",
+            "keep an eye",
+        ],
+    ) {
         IntentKind::Monitor
-    } else if contains_any(lower, &["research", "investigate", "find out", "compare", "learn about", "deep dive"]) {
+    } else if contains_any(
+        lower,
+        &[
+            "research",
+            "investigate",
+            "find out",
+            "compare",
+            "learn about",
+            "deep dive",
+        ],
+    ) {
         IntentKind::Research
-    } else if contains_any(lower, &["automate", "workflow", "every day", "every week", "recurring", "pipeline", "automatically"]) {
+    } else if contains_any(
+        lower,
+        &[
+            "automate",
+            "workflow",
+            "every day",
+            "every week",
+            "recurring",
+            "pipeline",
+            "automatically",
+        ],
+    ) {
         IntentKind::Automate
-    } else if contains_any(lower, &["message", "conversation", "chat", "inbox", "reply", "dm"]) {
+    } else if contains_any(
+        lower,
+        &["message", "conversation", "chat", "inbox", "reply", "dm"],
+    ) {
         IntentKind::Communicate
-    } else if contains_any(lower, &["organize", "collect", "gather", "consolidate", "digest", "summarize my"]) {
+    } else if contains_any(
+        lower,
+        &[
+            "organize",
+            "collect",
+            "gather",
+            "consolidate",
+            "digest",
+            "summarize my",
+        ],
+    ) {
         IntentKind::Organize
     } else {
         IntentKind::Create
@@ -603,7 +661,10 @@ mod tests {
         assert_eq!(intent.kind, IntentKind::Communicate);
         assert_eq!(intent.status, IntentStatus::Woven);
         for source in ["whatsapp", "telegram", "discord"] {
-            assert!(intent.sources.iter().any(|s| s == source), "missing {source}");
+            assert!(
+                intent.sources.iter().any(|s| s == source),
+                "missing {source}"
+            );
         }
         assert!(intent.agent_id.is_some());
         assert!(intent.execution_id.is_some());
@@ -629,7 +690,10 @@ mod tests {
         assert_eq!(intent.kind, IntentKind::Research);
         assert_eq!(intent.status, IntentStatus::Woven);
         assert!(
-            intent.tools_used.iter().any(|tool| tool.contains("deep_research")),
+            intent
+                .tools_used
+                .iter()
+                .any(|tool| tool.contains("deep_research")),
             "expected deep_research in tools, got {:?}",
             intent.tools_used
         );
@@ -646,7 +710,8 @@ mod tests {
             .expect("monitor intent");
         service
             .submit(SubmitIntentRequest {
-                description: "organize and summarize my email and notes into a weekly digest".into(),
+                description: "organize and summarize my email and notes into a weekly digest"
+                    .into(),
                 tenant_scope: TenantScope::Global,
             })
             .expect("organize intent");
@@ -717,7 +782,10 @@ mod tests {
         let episodes = chronicle.list_episodes();
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].source, "weave");
-        assert_eq!(episodes[0].source_ref.as_deref(), Some(intent.intent_id.as_str()));
+        assert_eq!(
+            episodes[0].source_ref.as_deref(),
+            Some(intent.intent_id.as_str())
+        );
         assert!(episodes[0].tags.iter().any(|tag| tag == "reddit"));
     }
 

@@ -42,7 +42,7 @@ use crate::common::{AppError, new_id, now_ms};
 use crate::device_agent::is_device_tool;
 use crate::forge::ForgeService;
 use crate::proof_economy::{AttackRequest, ClaimKind, ClaimStatus, ProofEconomy, ProposeRequest};
-use crate::verification::Check;
+use crate::verification::{Check, ProofContract};
 
 /// Independent re-execution reviews a fresh spec claim must survive to mint.
 const MINT_ATTACK_ROUNDS: u32 = 2;
@@ -102,6 +102,11 @@ pub struct AgentSpec {
     pub canary_objective: String,
     /// Context-free, re-runnable contract proving the canary run succeeded.
     pub success: Check,
+    /// Rich contract metadata: multi-check proof, optional eval suite, rollback
+    /// probes, and watch policy. `success` remains the primary check for older
+    /// callers.
+    #[serde(default)]
+    pub proof_contract: ProofContract,
     #[serde(default)]
     pub claim_id: Option<String>,
     pub status: SpecStatus,
@@ -154,6 +159,8 @@ struct SpecDraft {
     allow_tools: Vec<String>,
     canary_objective: String,
     success: Check,
+    #[serde(default)]
+    proof_contract: Option<ProofContract>,
 }
 
 /// The Architect. Composes agent specs, instantiates them through the verified
@@ -267,6 +274,11 @@ impl ArchitectService {
     ) -> Result<ComposeOutcome, AppError> {
         let now = now_ms();
         let spec_id = new_id("agent_spec");
+        let proof_contract = draft
+            .proof_contract
+            .clone()
+            .unwrap_or_else(|| ProofContract::single(draft.success.clone()));
+        let primary_success = proof_contract.primary_check();
         let mut spec = AgentSpec {
             spec_id: spec_id.clone(),
             name: draft.name.clone(),
@@ -278,7 +290,8 @@ impl ArchitectService {
             role: draft.role.clone(),
             allow_tools: draft.allow_tools.clone(),
             canary_objective: draft.canary_objective.clone(),
-            success: draft.success.clone(),
+            success: primary_success.clone(),
+            proof_contract: proof_contract.clone(),
             claim_id: None,
             status: SpecStatus::Probation,
             health: SpecHealth::default(),
@@ -295,7 +308,7 @@ impl ArchitectService {
             statement: format!("agent spec '{}' achieves its canary objective", spec.name),
             kind: ClaimKind::Assertion,
             proposer: format!("architect:{spec_id}"),
-            verification: draft.success.clone(),
+            verification: primary_success,
             evidence: vec![format!(
                 "canary loop status={}, all_verified={}",
                 canary_run.status, canary_run.all_verified
@@ -379,8 +392,8 @@ impl ArchitectService {
             spec.health.last_status = Some(result.status.clone());
             // "Verified" means the loop finished and nothing went unproven — the
             // same honest signal the loop reports to everyone else.
-            let ok = matches!(result.status.as_str(), "completed" | "recalled")
-                && result.all_verified;
+            let ok =
+                matches!(result.status.as_str(), "completed" | "recalled") && result.all_verified;
             if ok {
                 spec.health.verified_runs += 1;
             } else {
@@ -514,11 +527,7 @@ impl ArchitectService {
 
     // ── Authoring ───────────────────────────────────────────────────────────
 
-    async fn author_spec(
-        &self,
-        goal: &str,
-        repair: Option<&str>,
-    ) -> Result<SpecDraft, AppError> {
+    async fn author_spec(&self, goal: &str, repair: Option<&str>) -> Result<SpecDraft, AppError> {
         let forged = self.forge.catalog_for_prompt();
         let system = architect_system_prompt(&forged);
         let user = architect_user_prompt(goal, repair);
@@ -576,9 +585,19 @@ impl ArchitectService {
                 )));
             }
         }
-        if matches!(draft.success, Check::OutputContains { .. }) {
+        let proof_contract = draft
+            .proof_contract
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| ProofContract::single(draft.success.clone()));
+        if proof_contract
+            .checks
+            .iter()
+            .chain(proof_contract.rollback.iter())
+            .any(check_uses_loop_context)
+        {
             return Err(AppError::Validation(
-                "agent success contracts must be context-free (output_contains is not re-runnable)"
+                "agent success contracts must be context-free (output checks are not re-runnable)"
                     .into(),
             ));
         }
@@ -650,6 +669,15 @@ fn load_cache(connection: &Connection) -> Result<HashMap<String, AgentSpec>, App
         }
     }
     Ok(current)
+}
+
+fn check_uses_loop_context(check: &Check) -> bool {
+    match check {
+        Check::OutputContains { .. } | Check::OutputJsonPathEquals { .. } => true,
+        Check::All { checks } | Check::Any { checks } => checks.iter().any(check_uses_loop_context),
+        Check::Not { check } => check_uses_loop_context(check),
+        _ => false,
+    }
 }
 
 fn compose_objective(role: &str, objective: &str) -> String {
@@ -726,7 +754,9 @@ fn architect_system_prompt(forged: &[(String, String)]) -> String {
 fn architect_user_prompt(goal: &str, repair: Option<&str>) -> String {
     match repair {
         Some(diagnosis) => {
-            format!("{diagnosis}\n\nThe agent's goal class: {goal}\n\nReturn the corrected JSON spec now.")
+            format!(
+                "{diagnosis}\n\nThe agent's goal class: {goal}\n\nReturn the corrected JSON spec now."
+            )
         }
         None => format!("Design an agent that handles: {goal}\n\nReturn the JSON spec now."),
     }
@@ -765,11 +795,9 @@ mod tests {
             Box::pin(async { Err(AppError::Internal("unused".into())) })
         }
         fn complete(&self, _system: String, _user: String) -> BoxFuture<Result<String, AppError>> {
-            let next = self
-                .replies
-                .lock()
-                .pop_front()
-                .unwrap_or_else(|| r#"{"done":true,"final_answer":"out of script","reasoning":"x"}"#.into());
+            let next = self.replies.lock().pop_front().unwrap_or_else(|| {
+                r#"{"done":true,"final_answer":"out of script","reasoning":"x"}"#.into()
+            });
             Box::pin(async move { Ok(next) })
         }
     }
@@ -778,8 +806,8 @@ mod tests {
         let device = Arc::new(DeviceCapabilities::new(DevicePolicy::permissive()));
         let economy = ProofEconomy::in_memory(device.clone()).unwrap();
         let reasoner = ScriptedExecutor::new(replies);
-        let forge = ForgeService::in_memory(device.clone(), economy.clone(), reasoner.clone())
-            .unwrap();
+        let forge =
+            ForgeService::in_memory(device.clone(), economy.clone(), reasoner.clone()).unwrap();
         let agentic_loop = AgenticLoop::new(reasoner.clone(), device)
             .with_economy(economy.clone())
             .with_forge(forge.clone());
@@ -814,7 +842,8 @@ mod tests {
             r#"{{"reasoning":"write it","tool":"fs_write","input":{{"path":"{path}","content":"ready"}},
                 "postcondition":{{"type":"file_contains","path":"{path}","substring":"ready"}},"done":false}}"#
         );
-        let finish = r#"{"done":true,"final_answer":"file written","reasoning":"done"}"#.to_string();
+        let finish =
+            r#"{"done":true,"final_answer":"file written","reasoning":"done"}"#.to_string();
         let architect = architect_with(vec![spec, write, finish]);
 
         let outcome = architect
@@ -825,7 +854,11 @@ mod tests {
             .expect("compose");
 
         // The agent actually achieved its canary, so its proof minted and it is reusable.
-        assert!(outcome.minted, "spec proved itself -> should mint: {}", outcome.detail);
+        assert!(
+            outcome.minted,
+            "spec proved itself -> should mint: {}",
+            outcome.detail
+        );
         assert_eq!(outcome.spec.status, SpecStatus::Active);
         assert_eq!(outcome.canary_run.status, "completed");
         assert!(std::fs::read_to_string(&file).unwrap().contains("ready"));
@@ -849,11 +882,14 @@ mod tests {
                 "success":{{"type":"file_contains","path":"{path}","substring":"done"}}}}"#
         );
         // The loop immediately gives up without acting.
-        let finish = r#"{"done":true,"final_answer":"could not","reasoning":"blocked"}"#.to_string();
+        let finish =
+            r#"{"done":true,"final_answer":"could not","reasoning":"blocked"}"#.to_string();
         let architect = architect_with(vec![spec, finish]);
 
         let outcome = architect
-            .compose(ComposeRequest { goal: "do nothing useful".into() })
+            .compose(ComposeRequest {
+                goal: "do nothing useful".into(),
+            })
             .await
             .expect("compose");
 
@@ -862,7 +898,13 @@ mod tests {
         // Not runnable.
         assert!(
             architect
-                .run_spec("noop", RunSpecRequest { objective: "x".into(), max_iterations: 2 })
+                .run_spec(
+                    "noop",
+                    RunSpecRequest {
+                        objective: "x".into(),
+                        max_iterations: 2
+                    }
+                )
                 .await
                 .is_err()
         );
@@ -877,7 +919,10 @@ mod tests {
             "success":{"type":"command_succeeds","command":"echo hi"}}"#;
         let architect = architect_with(vec![spec.to_string()]);
         let result = architect.compose(ComposeRequest { goal: "x".into() }).await;
-        assert!(result.is_err(), "an agent may only be granted tools that exist");
+        assert!(
+            result.is_err(),
+            "an agent may only be granted tools that exist"
+        );
     }
 
     #[actix_web::test]

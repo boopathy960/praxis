@@ -1,0 +1,9 @@
+[package]
+name = "praxis-nucleus"
+version = "0.1.0"
+edition = "2021"
+description = "The Praxis OS kernel core: freestanding, zero-dependency, proof-scheduled."
+
+# Deliberately empty: the nucleus is built from scratch — its own spinlock, its
+# own allocator, its own executor. `no_std` everywhere except under `cargo test`.
+[dependencies]

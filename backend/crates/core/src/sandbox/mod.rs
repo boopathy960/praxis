@@ -15,6 +15,13 @@ use crate::common::{AppError, TenantScope, new_id, now_ms, sha3_hex};
 /// not just one session.
 const GLOBAL_PRINCIPAL: &str = "__global__";
 
+/// The sandbox's OWN control-plane principal ("the center"). It is deliberately
+/// an ordinary principal with NO exemption: actions attributed to it are
+/// evaluated and a global lockdown halts them like any other. This is what
+/// "even the sandbox center is inside the sandbox" means in code — the perimeter
+/// has no privileged actor that can act from outside it.
+pub(crate) const SANDBOX_CENTER_PRINCIPAL: &str = "sandbox-center";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
@@ -101,6 +108,37 @@ impl SandboxActionKind {
                 | Self::NexusDelivery
         )
     }
+
+    /// A stable, lowercase identifier for the kind. Used to build kind-scoped
+    /// lockdown keys so a seal can freeze just one action kind for a principal
+    /// (see [`SandboxService::seal_principal_kind`]) rather than the whole
+    /// principal. Stable across releases because it persists into the perimeter
+    /// table; do not rename casually.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::FileRead => "file_read",
+            Self::FileWrite => "file_write",
+            Self::FileDelete => "file_delete",
+            Self::NetworkFetch => "network_fetch",
+            Self::ShellExecution => "shell_execution",
+            Self::CodeExecution => "code_execution",
+            Self::DbQuery => "db_query",
+            Self::MessageSend => "message_send",
+            Self::SpendPayment => "spend_payment",
+            Self::IntegrationCall => "integration_call",
+            Self::NexusDelivery => "nexus_delivery",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Build the kind-scoped perimeter key for a principal. A seal written under this
+/// key freezes only actions of that kind for the principal — the border denial
+/// already contained the offending action, so a one-off denied-danger seal must
+/// not cascade onto the principal's other (harmless) tools.
+fn kind_scoped_principal(principal: &str, kind: SandboxActionKind) -> String {
+    format!("{principal}#kind={}", kind.tag())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +367,15 @@ pub struct SandboxRuntimeStatus {
     pub active_lockdowns: usize,
     /// Total recorded intrusion attempts (breakout + honeypot) in the feed.
     pub threat_events: usize,
+    /// True: the sandbox's own control plane ("center") is itself inside the
+    /// perimeter — it has no exempt principal, and a global lockdown halts every
+    /// caller including it. Everything the project does is enclosed; the only
+    /// thing not "inside" by construction is the monitor's own decision function
+    /// (it cannot gate itself without infinite regress) and OS-level isolation
+    /// (which needs a container runtime).
+    pub center_inside_perimeter: bool,
+    /// The non-exempt principal the control plane acts as.
+    pub perimeter_principal: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +564,8 @@ impl SandboxService {
             intrusion_lockdown_ms: self.config.policy.intrusion_lockdown_ms,
             active_lockdowns,
             threat_events,
+            center_inside_perimeter: true,
+            perimeter_principal: SANDBOX_CENTER_PRINCIPAL.into(),
         })
     }
 
@@ -550,8 +599,10 @@ impl SandboxService {
         let principal = principal_key(&normalized);
 
         // Lockdown gate — a sealed principal (denial-streak intrusion response)
-        // is refused before any capability is evaluated.
-        if let Some((until_ms, reason)) = self.active_lockdown(&principal)? {
+        // is refused before any capability is evaluated. The action's kind is
+        // threaded in so a narrow, kind-scoped police seal blocks only matching
+        // actions; full/global seals still block everything.
+        if let Some((until_ms, reason)) = self.active_lockdown(&principal, Some(normalized.kind))? {
             return self.sealed_receipt(&normalized, requested_execution, until_ms, reason);
         }
 
@@ -1241,20 +1292,34 @@ impl SandboxService {
     /// O(1) integrity check of the newest audit record. Returns a reason when
     /// Returns `(locked_until_ms, reason)` when the principal — or the whole
     /// monitor via the global seal — is currently locked out.
-    fn active_lockdown(&self, principal: &str) -> Result<Option<(i64, String)>, AppError> {
+    /// A lockdown is in force when *any* of three keys is sealed: the bare
+    /// `principal` (a full principal seal — breakout/army/governance), the
+    /// `GLOBAL_PRINCIPAL` (system-wide kill switch), or — when `kind` is given —
+    /// the kind-scoped key for this action's kind (a narrow police seal that
+    /// froze only the abused tool kind, leaving the principal's other tools live).
+    fn active_lockdown(
+        &self,
+        principal: &str,
+        kind: Option<SandboxActionKind>,
+    ) -> Result<Option<(i64, String)>, AppError> {
         let now = now_ms();
+        let scoped = kind.map(|kind| kind_scoped_principal(principal, kind));
+        // The scoped key falls back to the bare principal when no kind is given,
+        // so the third slot is always a harmless duplicate rather than a NULL.
+        let scoped_key = scoped.as_deref().unwrap_or(principal);
         let store = self.store.lock();
         let mut statement = store
             .prepare(
                 "SELECT locked_until_ms, COALESCE(last_reason, '') FROM sandbox_perimeter
-                 WHERE principal_key IN (?1, ?2) AND locked_until_ms > ?3
+                 WHERE principal_key IN (?1, ?2, ?3) AND locked_until_ms > ?4
                  ORDER BY locked_until_ms DESC LIMIT 1",
             )
             .map_err(sql_error)?;
         statement
-            .query_row(params![principal, GLOBAL_PRINCIPAL, now], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_row(
+                params![principal, GLOBAL_PRINCIPAL, scoped_key, now],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
             .optional()
             .map_err(sql_error)
     }
@@ -1280,6 +1345,45 @@ impl SandboxService {
             )
             .map_err(sql_error)?;
         Ok(until)
+    }
+
+    /// Seal a single principal out of every sandbox-mediated action for the
+    /// lockdown window — a deterministic "this principal can no longer act"
+    /// (revocation within our own boundary). Used by the governance layer's
+    /// enforcement. Returns the lockdown-until timestamp.
+    pub fn seal_principal(&self, principal: &str, reason: &str) -> Result<i64, AppError> {
+        self.seal_principal_now(principal, reason)
+    }
+
+    /// Seal a single *action kind* for a principal — a narrow lockdown that
+    /// freezes only that kind's actions, leaving the principal's other tools
+    /// live. Used by the police when the border already DENIED (and thus
+    /// contained) a one-off dangerous action: the abused kind is frozen, but the
+    /// device layer's harmless tools (e.g. network fetch) keep working, so a
+    /// single bad-but-blocked tool pick cannot self-DoS the whole principal.
+    /// Returns the lockdown-until timestamp.
+    pub fn seal_principal_kind(
+        &self,
+        principal: &str,
+        kind: SandboxActionKind,
+        reason: &str,
+    ) -> Result<i64, AppError> {
+        self.seal_principal_now(&kind_scoped_principal(principal, kind), reason)
+    }
+
+    /// Seal the entire monitor — refuse *every* caller for the lockdown window.
+    /// This is the system-wide kill switch the governance court alone commands.
+    pub fn seal_global(&self, reason: &str) -> Result<i64, AppError> {
+        self.seal_principal_now(GLOBAL_PRINCIPAL, reason)
+    }
+
+    /// Whether a system-wide lockdown is currently in force.
+    #[must_use]
+    pub fn is_globally_locked(&self) -> bool {
+        self.active_lockdown(GLOBAL_PRINCIPAL, None)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Append an intrusion attempt (breakout or honeypot) to the threat-intel
@@ -1763,7 +1867,7 @@ fn count_active_lockdowns(connection: &Connection) -> Result<usize, AppError> {
 /// Identity the perimeter loop accounts against: the tenant scope plus the
 /// session. Denials and lockdowns are tracked per principal so one abusive
 /// caller cannot lock out the rest of the system.
-fn principal_key(action: &SandboxAction) -> String {
+pub(crate) fn principal_key(action: &SandboxAction) -> String {
     let session = action
         .session_id
         .clone()
@@ -1977,6 +2081,111 @@ mod tests {
         let decision = service.evaluate(SandboxAction::default());
         assert_eq!(decision.outcome, SandboxDecisionOutcome::Deny);
         assert!(!decision.monitor.type_schema);
+    }
+
+    #[test]
+    fn even_the_sandbox_center_is_inside_the_perimeter() {
+        // The sandbox's own control-plane principal has NO exemption: once the
+        // court declares a global lockdown, an action attributed to the center is
+        // refused like any other caller. There is no actor outside the perimeter.
+        let service = service("center-inside");
+        let center_action = SandboxAction {
+            kind: SandboxActionKind::FileRead,
+            session_id: Some(SANDBOX_CENTER_PRINCIPAL.into()),
+            ..SandboxAction::default()
+        };
+        // Before lockdown the center is just an ordinary principal (not sealed).
+        let before = service.guard(center_action.clone(), false).expect("guard");
+        assert_ne!(
+            before.observation.get("status").and_then(|v| v.as_str()),
+            Some("perimeter_lockdown")
+        );
+        // A global lockdown halts EVERY caller, including the center.
+        service.seal_global("emergency drill").expect("lockdown");
+        let after = service.guard(center_action, false).expect("guard");
+        assert_eq!(
+            after.observation.get("status").and_then(|v| v.as_str()),
+            Some("perimeter_lockdown"),
+            "the sandbox center must be inside the perimeter it commands"
+        );
+        assert!(service.status().expect("status").center_inside_perimeter);
+    }
+
+    #[test]
+    fn kind_scoped_seal_freezes_only_its_kind() {
+        // The self-DoS fix: when the police seal a principal for a denied
+        // dangerous action, only that action KIND is frozen. The same principal's
+        // other tools (here, network fetch) stay live — a denied shell command
+        // must not cascade into freezing the agentic loop's web fetches.
+        let service = service("kind-scoped");
+        let principal_session = "device_principal_under_test";
+        let shell = SandboxAction {
+            kind: SandboxActionKind::ShellExecution,
+            command: Some("rm -rf /".into()),
+            session_id: Some(principal_session.into()),
+            ..SandboxAction::default()
+        };
+        let fetch = SandboxAction {
+            kind: SandboxActionKind::NetworkFetch,
+            url: Some("https://api.coindesk.com".into()),
+            session_id: Some(principal_session.into()),
+            ..SandboxAction::default()
+        };
+        let principal = principal_key(&shell);
+
+        // Seal ONLY the shell kind for this principal (what the police now do).
+        service
+            .seal_principal_kind(
+                &principal,
+                SandboxActionKind::ShellExecution,
+                "denied danger",
+            )
+            .expect("scoped seal");
+
+        // Shell is frozen by the scoped lockdown...
+        let shell_receipt = service.guard(shell, false).expect("guard shell");
+        assert_eq!(
+            shell_receipt
+                .observation
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("perimeter_lockdown"),
+            "the sealed kind must be frozen"
+        );
+        // ...but network fetch on the SAME principal is NOT frozen by it.
+        let fetch_receipt = service.guard(fetch, false).expect("guard fetch");
+        assert_ne!(
+            fetch_receipt
+                .observation
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("perimeter_lockdown"),
+            "a kind-scoped seal must not freeze the principal's other tools"
+        );
+    }
+
+    #[test]
+    fn full_principal_seal_still_freezes_every_kind() {
+        // The narrow seal is additive: a FULL principal seal (breakout / army /
+        // governance) must still freeze every kind, scoped fix notwithstanding.
+        let service = service("full-seal");
+        let session = "device_principal_full";
+        let fetch = SandboxAction {
+            kind: SandboxActionKind::NetworkFetch,
+            url: Some("https://example.com".into()),
+            session_id: Some(session.into()),
+            ..SandboxAction::default()
+        };
+        let principal = principal_key(&fetch);
+        service
+            .seal_principal(&principal, "full containment")
+            .expect("full seal");
+        let receipt = service.guard(fetch, false).expect("guard");
+        assert_eq!(
+            receipt.observation.get("status").and_then(|v| v.as_str()),
+            Some("perimeter_lockdown"),
+            "a full principal seal must still freeze all kinds"
+        );
     }
 
     #[test]

@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CEO Guardian — OS Security</title>
+    <style>
+      :root {
+        --bg: #0b0e14;
+        --panel: #141922;
+        --panel2: #1b2230;
+        --line: #263041;
+        --fg: #e6edf3;
+        --muted: #8b98a9;
+        --accent: #4aa8ff;
+        --a: #35d07f;
+        --b: #8fd14f;
+        --c: #e8c14a;
+        --d: #f0883e;
+        --crit: #f04a5a;
+        --high: #f0883e;
+        --mod: #e8c14a;
+        --low: #4aa8ff;
+        --info: #8b98a9;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 24px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      header h1 { font-size: 16px; margin: 0; letter-spacing: 0.5px; }
+      header .sub { color: var(--muted); font-size: 12px; }
+      main { padding: 20px 24px; max-width: 1200px; margin: 0 auto; }
+      .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px;
+      }
+      .card h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; letter-spacing: 1px; }
+      .grade { font-size: 52px; font-weight: 700; line-height: 1; }
+      .metric { font-size: 24px; font-weight: 600; }
+      .metric small { font-size: 12px; color: var(--muted); font-weight: 400; }
+      .bar { height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; margin-top: 8px; }
+      .bar > i { display: block; height: 100%; }
+      table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+      th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+      td.det { color: var(--muted); font-size: 12.5px; }
+      .pill { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+      .sev-Critical { background: rgba(240,74,90,.18); color: var(--crit); }
+      .sev-High { background: rgba(240,136,62,.18); color: var(--high); }
+      .sev-Moderate { background: rgba(232,193,74,.18); color: var(--mod); }
+      .sev-Low { background: rgba(74,168,255,.18); color: var(--low); }
+      .sev-Informational { background: rgba(139,152,169,.16); color: var(--info); }
+      .kind { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+      .mode { font-size: 11px; }
+      .mode.executed { color: var(--a); }
+      .mode.planned { color: var(--c); }
+      .mode.advisory { color: var(--low); }
+      .mode.failed { color: var(--crit); }
+      button {
+        background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+        border-radius: 8px; padding: 8px 14px; cursor: pointer; font: inherit; font-size: 13px;
+      }
+      button:hover { border-color: var(--accent); color: var(--accent); }
+      .section { margin-top: 22px; }
+      .section h2 { font-size: 13px; color: var(--fg); margin: 0 0 4px; }
+      .empty { color: var(--muted); padding: 12px 0; }
+      .roots { color: var(--muted); font-size: 12px; word-break: break-all; }
+      .flags b { color: var(--fg); font-weight: 600; }
+      .on { color: var(--a); }
+      .off { color: var(--muted); }
+      .toolbar { display: flex; gap: 10px; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>🛡️ CEO Guardian</h1>
+        <div class="sub" id="subtitle">continuous, autonomous OS-security — loading…</div>
+      </div>
+      <div class="toolbar">
+        <span class="sub" id="refreshed"></span>
+        <button id="patrolBtn">Run patrol</button>
+        <button id="remediateBtn">Run remediation</button>
+      </div>
+    </header>
+    <main>
+      <div class="row">
+        <div class="card">
+          <h2>Security grade</h2>
+          <div class="grade" id="grade">–</div>
+          <div id="postureLine" class="sub"></div>
+        </div>
+        <div class="card">
+          <h2>Health</h2>
+          <div class="metric" id="health">–</div>
+          <div class="bar"><i id="healthBar" style="width:0%"></i></div>
+        </div>
+        <div class="card">
+          <h2>Open remediations</h2>
+          <div class="metric" id="openRem">–</div>
+          <div class="sub">awaiting court / human action</div>
+        </div>
+        <div class="card">
+          <h2>Baseline</h2>
+          <div class="metric" id="baseline">–<small> surfaces learned</small></div>
+          <div class="sub" id="patrolsCount"></div>
+        </div>
+      </div>
+
+      <div class="card section flags">
+        <h2>Posture</h2>
+        <div id="flags"></div>
+        <div class="roots" id="roots"></div>
+      </div>
+
+      <div class="section">
+        <h2>Recent findings</h2>
+        <div id="findings"><div class="empty">loading…</div></div>
+      </div>
+
+      <div class="section">
+        <h2>Remediations</h2>
+        <div id="remediations"><div class="empty">loading…</div></div>
+      </div>
+
+      <div class="section">
+        <h2>Recent patrols</h2>
+        <div id="patrols"><div class="empty">loading…</div></div>
+      </div>
+    </main>
+
+    <script>
+      const API = "/api/v1/ceo/guardian";
+      const $ = (id) => document.getElementById(id);
+      const esc = (s) =>
+        String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+      async function get(path) {
+        const r = await fetch(API + path);
+        if (!r.ok) throw new Error(path + " -> " + r.status);
+        const j = await r.json();
+        return j && j.data !== undefined ? j.data : j;
+      }
+      async function post(path) {
+        const r = await fetch(API + path, { method: "POST" });
+        const j = await r.json().catch(() => ({}));
+        return j && j.data !== undefined ? j.data : j;
+      }
+
+      const gradeColor = { A: "var(--a)", B: "var(--b)", C: "var(--c)", D: "var(--d)", F: "var(--crit)" };
+
+      function sevPill(sev) {
+        return `<span class="pill sev-${esc(sev)}">${esc(sev)}</span>`;
+      }
+
+      function renderPosture(p) {
+        $("grade").textContent = p.grade;
+        $("grade").style.color = gradeColor[p.grade] || "var(--fg)";
+        $("health").textContent = (p.health * 100).toFixed(0) + "%";
+        const hb = $("healthBar");
+        hb.style.width = p.health * 100 + "%";
+        hb.style.background = gradeColor[p.grade] || "var(--a)";
+        $("openRem").textContent = p.open_remediations;
+        $("postureLine").textContent = `risk ${p.risk} · ${p.recent_findings} recent finding(s)`;
+        const bySev = Object.entries(p.recent_by_severity || {})
+          .map(([k, v]) => `${sevPill(k)} ${v}`)
+          .join(" &nbsp; ");
+        $("flags").innerHTML =
+          `peak: <b>${esc(p.peak_severity || "none")}</b> &nbsp;·&nbsp; ${bySev || '<span class="sub">no recent findings</span>'}`;
+      }
+
+      function renderStatus(s) {
+        $("subtitle").textContent =
+          `model-backed: ${s.model_backed ? "yes" : "no"} · self-mod: ${s.self_modification_enabled ? "on" : "off"} · forge: ${s.capability_forging_enabled ? "on" : "off"}`;
+        $("baseline").innerHTML = `${s.baseline_size}<small> surfaces learned</small>`;
+        $("patrolsCount").textContent = `${s.total_patrols} patrols · ${s.total_findings} findings total`;
+        $("roots").innerHTML = "scan roots: " + (s.scan_roots || []).map(esc).join(" · ");
+      }
+
+      function renderFindings(list) {
+        if (!list || !list.length) { $("findings").innerHTML = '<div class="empty">no findings recorded</div>'; return; }
+        const rows = list
+          .map(
+            (f) => `<tr>
+              <td>${sevPill(f.severity)}</td>
+              <td><span class="kind">${esc(f.kind)}</span></td>
+              <td>${esc(f.subject)}</td>
+              <td class="det">${esc(f.detail)}<br><span class="mode ${esc(f.remediation)}">${esc(f.remediation)}</span> ${esc(f.remediation_detail || "")}</td>
+            </tr>`
+          )
+          .join("");
+        $("findings").innerHTML = `<table><thead><tr><th>Sev</th><th>Kind</th><th>Subject</th><th>Detail / response</th></tr></thead><tbody>${rows}</tbody></table>`;
+      }
+
+      function renderRemediations(list) {
+        if (!list || !list.length) { $("remediations").innerHTML = '<div class="empty">no remediations yet</div>'; return; }
+        const rows = list
+          .map(
+            (r) => `<tr>
+              <td><span class="mode ${esc(r.mode)}">${esc(r.mode)}</span></td>
+              <td>${esc(r.action)}</td>
+              <td class="det">${esc(r.detail)}</td>
+            </tr>`
+          )
+          .join("");
+        $("remediations").innerHTML = `<table><thead><tr><th>Mode</th><th>Action</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+      }
+
+      function renderPatrols(list) {
+        if (!list || !list.length) { $("patrols").innerHTML = '<div class="empty">no patrols yet</div>'; return; }
+        const rows = list
+          .map((p) => {
+            const c = p.counts || {};
+            return `<tr>
+              <td>${sevPill(p.peak_severity || "Informational")}</td>
+              <td class="det">${c.processes_scanned || 0} proc · ${c.files_scanned || 0} files/${c.dirs_walked || 0} dirs · ${c.connections_scanned || 0} conns</td>
+              <td class="det">${c.findings || 0} findings · ${c.auto_healed || 0} healed · ${c.approvals_requested || 0} approvals · ${c.self_mods_proposed || 0} self-mods</td>
+            </tr>`;
+          })
+          .join("");
+        $("patrols").innerHTML = `<table><thead><tr><th>Peak</th><th>Scanned</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table>`;
+      }
+
+      async function refresh() {
+        try {
+          const [posture, status, findings, remediations, patrols] = await Promise.all([
+            get("/posture"),
+            get("/status"),
+            get("/findings"),
+            get("/remediations"),
+            get("/patrols"),
+          ]);
+          renderPosture(posture);
+          renderStatus(status);
+          renderFindings(findings);
+          renderRemediations(remediations);
+          renderPatrols(patrols);
+          $("refreshed").textContent = "updated " + new Date().toLocaleTimeString();
+        } catch (e) {
+          $("subtitle").textContent = "error: " + e.message + " (is the server running / admin-open in dev?)";
+        }
+      }
+
+      $("patrolBtn").onclick = async () => {
+        $("patrolBtn").textContent = "patrolling…";
+        try { await post("/patrol"); } catch (e) {}
+        $("patrolBtn").textContent = "Run patrol";
+        refresh();
+      };
+      $("remediateBtn").onclick = async () => {
+        $("remediateBtn").textContent = "running…";
+        try { await post("/remediate"); } catch (e) {}
+        $("remediateBtn").textContent = "Run remediation";
+        refresh();
+      };
+
+      refresh();
+      setInterval(refresh, 15000);
+    </script>
+  </body>
+</html>

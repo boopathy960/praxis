@@ -31,7 +31,11 @@ async fn compose(
         format!(
             "composed agent '{}' ({}) — {}",
             outcome.spec.name,
-            if outcome.minted { "minted/active" } else { "probation" },
+            if outcome.minted {
+                "minted/active"
+            } else {
+                "probation"
+            },
             outcome.detail
         ),
         "architect",

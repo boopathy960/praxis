@@ -228,11 +228,7 @@ impl TelegramKeyStore {
         Ok(row)
     }
 
-    pub fn set_active_provider(
-        &self,
-        chat_id: i64,
-        provider: BotProvider,
-    ) -> Result<(), AppError> {
+    pub fn set_active_provider(&self, chat_id: i64, provider: BotProvider) -> Result<(), AppError> {
         self.store
             .lock()
             .execute(
@@ -271,7 +267,12 @@ impl TelegramKeyStore {
         }
     }
 
-    pub fn set_model(&self, chat_id: i64, provider: BotProvider, model: &str) -> Result<bool, AppError> {
+    pub fn set_model(
+        &self,
+        chat_id: i64,
+        provider: BotProvider,
+        model: &str,
+    ) -> Result<bool, AppError> {
         let updated = self
             .store
             .lock()
@@ -424,9 +425,9 @@ pub fn parse_command(text: &str) -> BotCommand {
             None | Some("all") => BotCommand::DeleteKey(None),
             Some(raw) => match BotProvider::parse(raw) {
                 Some(provider) => BotCommand::DeleteKey(Some(provider)),
-                None => BotCommand::Invalid(
-                    "Usage: /delkey [gemini|openrouter|deepseek|all]".into(),
-                ),
+                None => {
+                    BotCommand::Invalid("Usage: /delkey [gemini|openrouter|deepseek|all]".into())
+                }
             },
         },
         "/status" => BotCommand::Status,
@@ -476,10 +477,7 @@ impl TelegramBot {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!(
-            "{TELEGRAM_API_BASE}/bot{}/{method}",
-            self.config.bot_token
-        )
+        format!("{TELEGRAM_API_BASE}/bot{}/{method}", self.config.bot_token)
     }
 
     /// Long-poll loop; never returns under normal operation.
@@ -569,7 +567,8 @@ impl TelegramBot {
         if !self.config.allowed_chat_ids.is_empty()
             && !self.config.allowed_chat_ids.contains(&chat_id)
         {
-            self.send_message(chat_id, "This Astra instance is private.").await;
+            self.send_message(chat_id, "This Astra instance is private.")
+                .await;
             return;
         }
         if chat_type != "private" {
@@ -717,14 +716,19 @@ impl TelegramBot {
             Err(_) => return "Could not read the local key store.".into(),
         };
         if keys.is_empty() {
-            return "No providers configured. Start with /setkey gemini <api_key> — see /help.".into();
+            return "No providers configured. Start with /setkey gemini <api_key> — see /help."
+                .into();
         }
         let active = self.keys.active_provider(chat_id).ok().flatten();
         let mut lines = vec!["Your providers on this device:".to_string()];
         for stored in keys {
             lines.push(format!(
                 "{} {} — model {}, key {}",
-                if active == Some(stored.provider) { "▶" } else { "•" },
+                if active == Some(stored.provider) {
+                    "▶"
+                } else {
+                    "•"
+                },
                 stored.provider.as_str(),
                 stored.model,
                 mask_key(&stored.api_key),
@@ -981,9 +985,15 @@ mod tests {
         store
             .set_key(7, BotProvider::Gemini, "secret-key", "gemini-2.5-flash")
             .expect("set");
-        let stored = store.get_key(7, BotProvider::Gemini).expect("get").expect("some");
+        let stored = store
+            .get_key(7, BotProvider::Gemini)
+            .expect("get")
+            .expect("some");
         assert_eq!(stored.api_key, "secret-key");
-        assert_eq!(store.active_provider(7).expect("active"), Some(BotProvider::Gemini));
+        assert_eq!(
+            store.active_provider(7).expect("active"),
+            Some(BotProvider::Gemini)
+        );
 
         store
             .set_key(7, BotProvider::DeepSeek, "other-key", "deepseek-chat")
@@ -998,9 +1008,18 @@ mod tests {
         let active = store.active_key(7).expect("active key").expect("some");
         assert_eq!(active.provider, BotProvider::Gemini);
 
-        assert!(store.set_model(7, BotProvider::Gemini, "gemini-2.5-pro").expect("model"));
+        assert!(
+            store
+                .set_model(7, BotProvider::Gemini, "gemini-2.5-pro")
+                .expect("model")
+        );
         assert!(store.delete_key(7, BotProvider::Gemini).expect("delete"));
-        assert!(store.get_key(7, BotProvider::Gemini).expect("get").is_none());
+        assert!(
+            store
+                .get_key(7, BotProvider::Gemini)
+                .expect("get")
+                .is_none()
+        );
         assert_eq!(store.delete_all_keys(7).expect("delete all"), 1);
         std::fs::remove_dir_all(&dir).ok();
     }

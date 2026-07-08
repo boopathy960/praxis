@@ -1,0 +1,32 @@
+# Merge these overrides on top of SearXNG's full default settings.
+# Without this, the file REPLACES the defaults and required keys like
+# 'default_doi_resolver' go missing -> every request 500s.
+use_default_settings: true
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "astra_super_secret_key"
+  # Local API use: disable the bot limiter so format=json calls aren't blocked.
+  limiter: false
+  public_instance: false
+
+search:
+  # Enable JSON output so Astra's web_search can consume results.
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+  - name: google
+    engine: google
+    shortcut: go
+    disabled: true

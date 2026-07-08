@@ -379,10 +379,8 @@ pub struct SearchIntelligenceService {
 impl SearchIntelligenceService {
     #[must_use]
     pub fn new() -> Self {
-        let data_dir = std::env::temp_dir().join(format!(
-            "astra-search-intelligence-{}",
-            new_id("ephemeral")
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("astra-search-intelligence-{}", new_id("ephemeral")));
         Self::with_data_dir(data_dir).expect("ephemeral search intelligence store should open")
     }
 
@@ -441,7 +439,8 @@ impl SearchIntelligenceService {
             if quality < 0.35 {
                 reasons.push("quality gate failed".into());
             }
-            let accepted_by_gates = gate.allowed && quality >= 0.35 && candidate.fetch_error.is_none();
+            let accepted_by_gates =
+                gate.allowed && quality >= 0.35 && candidate.fetch_error.is_none();
             let evidence_tags = evidence_tags(&candidate, accepted_by_gates);
             let evidence = SearchEvidence {
                 evidence_id: new_id("evidence"),
@@ -474,7 +473,13 @@ impl SearchIntelligenceService {
                 },
             };
             if accepted_by_gates {
-                self.persist_candidate(&candidate, relevance, credibility, freshness, verification)?;
+                self.persist_candidate(
+                    &candidate,
+                    relevance,
+                    credibility,
+                    freshness,
+                    verification,
+                )?;
                 accepted.push(evidence);
             } else {
                 blocked.push(item);
@@ -698,11 +703,9 @@ impl SearchIntelligenceService {
             });
         }
         let average_score = avg(reports.iter().map(|case| case.score));
-        let calibration_error = avg(
-            reports
-                .iter()
-                .map(|case| (case.confidence - case.expected_term_recall).abs()),
-        );
+        let calibration_error = avg(reports
+            .iter()
+            .map(|case| (case.confidence - case.expected_term_recall).abs()));
         let report = SearchBenchmarkReport {
             benchmark_id: new_id("search_benchmark"),
             created_at_ms: now_ms(),
@@ -897,16 +900,12 @@ impl SearchIntelligenceService {
             }
             let semantic = match QuantizedVector::from_compact_string(&row.embedding_json) {
                 Some(quantized) => {
-                    let estimate =
-                        embedding_quantizer().inner_product(&prepared_query, &quantized);
+                    let estimate = embedding_quantizer().inner_product(&prepared_query, &quantized);
                     ((estimate + 1.0) / 2.0).clamp(0.0, 1.0)
                 }
                 // Rows persisted before quantization hold raw JSON vectors;
                 // they re-quantize on their next upsert.
-                None => cosine_similarity(
-                    &query_embedding,
-                    &decode_embedding(&row.embedding_json),
-                ),
+                None => cosine_similarity(&query_embedding, &decode_embedding(&row.embedding_json)),
             };
             let lexical = relevance_score(&request.query, &row.text);
             let rank = (semantic * 0.62 + lexical * 0.38).clamp(0.0, 1.0);
@@ -1036,8 +1035,7 @@ impl SearchIntelligenceService {
                     }
                 }
             }
-            let response =
-                response.ok_or_else(|| AppError::Internal(last_error.clone()))?;
+            let response = response.ok_or_else(|| AppError::Internal(last_error.clone()))?;
             let status = response.status();
             if !status.is_success() {
                 return Err(AppError::Internal(format!("HTTP status {status}")));
@@ -1249,11 +1247,17 @@ impl SearchIntelligenceService {
                         }
                     }
                     self.mark_queue_status(&item.url, "completed", "")?;
-                    generated.push(format!("{} {}", candidate.source_class.as_str(), candidate.domain));
+                    generated.push(format!(
+                        "{} {}",
+                        candidate.source_class.as_str(),
+                        candidate.domain
+                    ));
                     processed.push(item.url);
                 }
                 Some(candidate) => {
-                    let error = candidate.fetch_error.unwrap_or_else(|| "fetch failed".into());
+                    let error = candidate
+                        .fetch_error
+                        .unwrap_or_else(|| "fetch failed".into());
                     self.mark_queue_status(&item.url, "failed", &error)?;
                     failed.push(format!("{}: {error}", item.url));
                 }
@@ -2226,7 +2230,9 @@ fn extract_links(text: &str, base: Option<&Url>) -> Vec<String> {
         let Some(raw) = capture.get(1).map(|item| item.as_str().trim()) else {
             continue;
         };
-        let parsed = Url::parse(raw).ok().or_else(|| base.and_then(|base| base.join(raw).ok()));
+        let parsed = Url::parse(raw)
+            .ok()
+            .or_else(|| base.and_then(|base| base.join(raw).ok()));
         if let Some(parsed) = parsed {
             if matches!(parsed.scheme(), "http" | "https") {
                 out.insert(parsed.to_string());
@@ -2299,9 +2305,8 @@ fn source_class_from_str(value: &str) -> SearchSourceClass {
 /// diagonals, so this is cheap and shared by the persist and query paths.
 fn embedding_quantizer() -> &'static TurboQuant {
     static QUANTIZER: OnceLock<TurboQuant> = OnceLock::new();
-    QUANTIZER.get_or_init(|| {
-        TurboQuant::new(EMBEDDING_DIMS, EMBEDDING_BITS, EMBEDDING_QUANTIZER_SEED)
-    })
+    QUANTIZER
+        .get_or_init(|| TurboQuant::new(EMBEDDING_DIMS, EMBEDDING_BITS, EMBEDDING_QUANTIZER_SEED))
 }
 
 fn semantic_embedding(text: &str) -> Vec<f64> {
@@ -2637,8 +2642,14 @@ mod tests {
         let strong_score = relevance_score(query, strong);
         let partial_score = relevance_score(query, partial);
         let empty_score = relevance_score(query, empty);
-        assert!(strong_score > partial_score, "{strong_score} vs {partial_score}");
-        assert!(partial_score > empty_score, "{partial_score} vs {empty_score}");
+        assert!(
+            strong_score > partial_score,
+            "{strong_score} vs {partial_score}"
+        );
+        assert!(
+            partial_score > empty_score,
+            "{partial_score} vs {empty_score}"
+        );
         assert!((0.0..=1.0).contains(&strong_score));
 
         // Exact phrase match outranks the same words scattered apart.

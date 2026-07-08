@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::asc2::ReasoningExecutor;
 use crate::common::AppError;
-use crate::proof_economy::{AttackRequest, Check, ClaimKind, ClaimStatus, ProofEconomy, ProposeRequest};
+use crate::proof_economy::{
+    AttackRequest, Check, ClaimKind, ClaimStatus, ProofEconomy, ProposeRequest,
+};
 
 const PROPOSER_SYSTEM: &str = "You are a claim proposer in a proof economy. Propose ONE verifiable \
 claim as a single JSON object, no prose: {\"statement\":\"...\",\"kind\":\"assertion|refutation|impossibility\",\
@@ -122,9 +124,8 @@ impl ProofConductor {
         // ── Propose phase ──
         let mut proposed_ids: Vec<String> = Vec::new();
         for index in 0..num_proposals {
-            let user = format!(
-                "Topic: {topic}\nPropose one verifiable claim about it now, as JSON."
-            );
+            let user =
+                format!("Topic: {topic}\nPropose one verifiable claim about it now, as JSON.");
             let raw = self.reasoner.complete(PROPOSER_SYSTEM.into(), user).await?;
             let Some(parsed) = parse_json::<ProposedClaim>(&raw) else {
                 continue;
@@ -138,8 +139,9 @@ impl ProofConductor {
                 evidence: parsed.evidence,
                 depends_on: Vec::new(),
             };
-            if let Ok(claim) =
-                actix_web::web::block(move || economy.propose(request)).await.map_err(join_err)?
+            if let Ok(claim) = actix_web::web::block(move || economy.propose(request))
+                .await
+                .map_err(join_err)?
             {
                 proposed_ids.push(claim.claim_id);
             }
@@ -320,7 +322,11 @@ mod tests {
         let attack = r#"{"note":"surely false","counter":null}"#.to_string();
         let conductor = conductor(vec![propose, attack.clone(), attack]);
         let report = conductor
-            .run_round(RoundConfig { topic: "math".into(), num_proposals: 1, attack_budget: 2 })
+            .run_round(RoundConfig {
+                topic: "math".into(),
+                num_proposals: 1,
+                attack_budget: 2,
+            })
             .await
             .expect("round");
         assert_eq!(report.proposals_made, 1);
@@ -336,7 +342,11 @@ mod tests {
         let lie = r#"{"statement":"echo 42 prints 99","check":{"type":"shell_output_contains","command":"echo 42","substring":"99"}}"#.to_string();
         let conductor = conductor(vec![lie]);
         let report = conductor
-            .run_round(RoundConfig { topic: "x".into(), num_proposals: 1, attack_budget: 0 })
+            .run_round(RoundConfig {
+                topic: "x".into(),
+                num_proposals: 1,
+                attack_budget: 0,
+            })
             .await
             .expect("round");
         assert_eq!(report.refuted_this_round, 1);

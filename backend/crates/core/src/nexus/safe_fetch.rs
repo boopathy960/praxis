@@ -20,7 +20,9 @@ pub fn safe_fetch_html(url_str: &str) -> Result<String, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| crate::common::AppError::Internal(format!("Failed to build client: {e}")))?;
+            .map_err(|e| {
+                crate::common::AppError::Internal(format!("Failed to build client: {e}"))
+            })?;
 
         let response = client
             .get(parsed_url)

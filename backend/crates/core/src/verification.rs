@@ -17,12 +17,32 @@ use crate::device_agent::DeviceCapabilities;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Check {
+    /// Every nested check must pass.
+    All { checks: Vec<Check> },
+    /// At least one nested check must pass.
+    Any { checks: Vec<Check> },
+    /// The nested check must fail.
+    Not { check: Box<Check> },
     /// The file exists and is readable.
     FileExists { path: String },
     /// The file exists and contains the substring.
     FileContains { path: String, substring: String },
+    /// A JSON file has a value at `pointer` equal to `expected`.
+    JsonPathEquals {
+        path: String,
+        pointer: String,
+        expected: Value,
+    },
+    /// A JSON file has a string-like value at `pointer` containing `substring`.
+    JsonPathContains {
+        path: String,
+        pointer: String,
+        substring: String,
+    },
     /// The path does not exist (e.g. after a delete).
     PathAbsent { path: String },
+    /// A guarded HTTP GET body contains the substring.
+    HttpBodyContains { url: String, substring: String },
     /// A shell command exits 0 and its stdout contains the substring.
     ShellOutputContains { command: String, substring: String },
     /// A shell command exits 0.
@@ -32,8 +52,59 @@ pub enum Check {
     /// The just-run action's own output contains the substring (loop-only:
     /// needs the action's output as context).
     OutputContains { substring: String },
+    /// The just-run action's own JSON output has a value equal to `expected`.
+    OutputJsonPathEquals { pointer: String, expected: Value },
     /// Scaffolding for dependencies/tests.
     Trivial { pass: bool },
+}
+
+/// A richer success contract layered on top of `Check`.
+///
+/// `checks` are the truth-bearing predicates. `eval_suite_id` can point at a
+/// separately managed golden/adversarial suite. `rollback` checks are expected
+/// to hold after cleanup of a mutating action. `watch_policy` lets callers state
+/// whether this contract should be placed under continuous re-verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofContract {
+    #[serde(default)]
+    pub checks: Vec<Check>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_suite_id: Option<String>,
+    #[serde(default)]
+    pub rollback: Vec<Check>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_policy: Option<String>,
+}
+
+impl ProofContract {
+    #[must_use]
+    pub fn single(check: Check) -> Self {
+        Self {
+            checks: vec![check],
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn primary_check(&self) -> Check {
+        match self.checks.as_slice() {
+            [one] => one.clone(),
+            checks => Check::All {
+                checks: checks.to_vec(),
+            },
+        }
+    }
+}
+
+impl Default for ProofContract {
+    fn default() -> Self {
+        Self {
+            checks: vec![Check::Trivial { pass: true }],
+            eval_suite_id: None,
+            rollback: Vec::new(),
+            watch_policy: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,10 +119,18 @@ impl Check {
     #[must_use]
     pub fn is_reversible(&self) -> bool {
         match self {
+            Check::All { checks } | Check::Any { checks } => {
+                checks.iter().all(Check::is_reversible)
+            }
+            Check::Not { check } => check.is_reversible(),
             Check::FileExists { .. }
             | Check::FileContains { .. }
+            | Check::JsonPathEquals { .. }
+            | Check::JsonPathContains { .. }
             | Check::PathAbsent { .. }
+            | Check::HttpBodyContains { .. }
             | Check::OutputContains { .. }
+            | Check::OutputJsonPathEquals { .. }
             | Check::Trivial { .. } => true,
             Check::ShellOutputContains { command, .. }
             | Check::CommandSucceeds { command }
@@ -63,8 +142,18 @@ impl Check {
     #[must_use]
     pub fn cost(&self) -> f64 {
         match self {
-            Check::Trivial { .. } | Check::OutputContains { .. } => 0.1,
-            Check::FileExists { .. } | Check::FileContains { .. } | Check::PathAbsent { .. } => 1.0,
+            Check::All { checks } => checks.iter().map(Check::cost).sum(),
+            Check::Any { checks } => checks.iter().map(Check::cost).fold(0.0, f64::max),
+            Check::Not { check } => check.cost(),
+            Check::Trivial { .. }
+            | Check::OutputContains { .. }
+            | Check::OutputJsonPathEquals { .. } => 0.1,
+            Check::FileExists { .. }
+            | Check::FileContains { .. }
+            | Check::JsonPathEquals { .. }
+            | Check::JsonPathContains { .. }
+            | Check::PathAbsent { .. } => 1.0,
+            Check::HttpBodyContains { .. } => 2.0,
             _ => 3.0,
         }
     }
@@ -75,6 +164,53 @@ impl Check {
 #[must_use]
 pub fn run(check: &Check, device: &DeviceCapabilities, context: Option<&Value>) -> CheckOutcome {
     match check {
+        Check::All { checks } => {
+            let outcomes = checks
+                .iter()
+                .map(|check| run(check, device, context))
+                .collect::<Vec<_>>();
+            let pass = outcomes.iter().all(|outcome| outcome.pass);
+            outcome(
+                pass,
+                format!(
+                    "all({}/{}) [{}]",
+                    outcomes.iter().filter(|outcome| outcome.pass).count(),
+                    outcomes.len(),
+                    outcomes
+                        .iter()
+                        .map(|outcome| outcome.detail.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            )
+        }
+        Check::Any { checks } => {
+            let outcomes = checks
+                .iter()
+                .map(|check| run(check, device, context))
+                .collect::<Vec<_>>();
+            let pass = outcomes.iter().any(|outcome| outcome.pass);
+            outcome(
+                pass,
+                format!(
+                    "any({}/{}) [{}]",
+                    outcomes.iter().filter(|outcome| outcome.pass).count(),
+                    outcomes.len(),
+                    outcomes
+                        .iter()
+                        .map(|outcome| outcome.detail.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            )
+        }
+        Check::Not { check } => {
+            let inner = run(check, device, context);
+            outcome(
+                !inner.pass,
+                format!("not({}): {}", inner.pass, inner.detail),
+            )
+        }
         Check::Trivial { pass } => outcome(*pass, format!("trivial({pass})")),
         Check::OutputContains { substring } => match context {
             Some(value) => {
@@ -85,6 +221,17 @@ pub fn run(check: &Check, device: &DeviceCapabilities, context: Option<&Value>) 
                     .unwrap_or_else(|| value.to_string());
                 let pass = haystack.contains(substring);
                 outcome(pass, format!("output contains \"{substring}\": {pass}"))
+            }
+            None => outcome(false, "no action output available to check".into()),
+        },
+        Check::OutputJsonPathEquals { pointer, expected } => match context {
+            Some(value) => {
+                let actual = value.pointer(pointer);
+                let pass = actual == Some(expected);
+                outcome(
+                    pass,
+                    format!("output pointer {pointer} == {}: {pass}", expected),
+                )
             }
             None => outcome(false, "no action output available to check".into()),
         },
@@ -99,10 +246,47 @@ pub fn run(check: &Check, device: &DeviceCapabilities, context: Option<&Value>) 
             }
             Err(error) => outcome(false, format!("{path} unreadable: {error}")),
         },
+        Check::JsonPathEquals {
+            path,
+            pointer,
+            expected,
+        } => match read_json_file(device, path) {
+            Ok(value) => {
+                let actual = value.pointer(pointer);
+                let pass = actual == Some(expected);
+                outcome(pass, format!("{path}{pointer} == {}: {pass}", expected))
+            }
+            Err(error) => outcome(false, format!("{path} JSON unreadable: {error}")),
+        },
+        Check::JsonPathContains {
+            path,
+            pointer,
+            substring,
+        } => match read_json_file(device, path) {
+            Ok(value) => {
+                let haystack = value.pointer(pointer).map(json_text).unwrap_or_default();
+                let pass = haystack.contains(substring);
+                outcome(
+                    pass,
+                    format!("{path}{pointer} contains \"{substring}\": {pass}"),
+                )
+            }
+            Err(error) => outcome(false, format!("{path} JSON unreadable: {error}")),
+        },
         Check::PathAbsent { path } => match read_file(device, path) {
             Ok(_) => outcome(false, format!("{path} still exists")),
             Err(_) => outcome(true, format!("{path} is absent")),
         },
+        Check::HttpBodyContains { url, substring } => {
+            match device.execute("http_get", &json!({ "url": url })) {
+                Ok(value) => {
+                    let body = value.get("body").and_then(Value::as_str).unwrap_or("");
+                    let pass = body.contains(substring);
+                    outcome(pass, format!("{url} body contains \"{substring}\": {pass}"))
+                }
+                Err(error) => outcome(false, format!("http_get error: {error}")),
+            }
+        }
         Check::ShellOutputContains { command, substring } => match shell(device, command) {
             Ok(value) => {
                 let stdout = value.get("stdout").and_then(Value::as_str).unwrap_or("");
@@ -110,7 +294,10 @@ pub fn run(check: &Check, device: &DeviceCapabilities, context: Option<&Value>) 
                 let pass = exit_ok && stdout.contains(substring);
                 outcome(
                     pass,
-                    format!("exit_ok={exit_ok}, contains=\"{substring}\":{}", stdout.contains(substring)),
+                    format!(
+                        "exit_ok={exit_ok}, contains=\"{substring}\":{}",
+                        stdout.contains(substring)
+                    ),
                 )
             }
             Err(error) => outcome(false, format!("command error: {error}")),
@@ -125,13 +312,31 @@ pub fn run(check: &Check, device: &DeviceCapabilities, context: Option<&Value>) 
         Check::CommandFails { command } => match shell(device, command) {
             Ok(value) => {
                 let code = value.get("exit_code").and_then(Value::as_i64);
-                let killed = value.get("killed").and_then(Value::as_bool).unwrap_or(false);
+                let killed = value
+                    .get("killed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let fails = killed || code != Some(0);
-                outcome(fails, format!("did not succeed (code={code:?}, killed={killed})"))
+                outcome(
+                    fails,
+                    format!("did not succeed (code={code:?}, killed={killed})"),
+                )
             }
-            Err(error) => outcome(true, format!("command could not run (counts as fail): {error}")),
+            Err(error) => outcome(
+                true,
+                format!("command could not run (counts as fail): {error}"),
+            ),
         },
     }
+}
+
+#[must_use]
+pub fn run_contract(
+    contract: &ProofContract,
+    device: &DeviceCapabilities,
+    context: Option<&Value>,
+) -> CheckOutcome {
+    run(&contract.primary_check(), device, context)
 }
 
 fn outcome(pass: bool, detail: String) -> CheckOutcome {
@@ -147,6 +352,18 @@ fn read_file(device: &DeviceCapabilities, path: &str) -> Result<String, String> 
         .ok_or_else(|| "file had no readable content".to_string())
 }
 
+fn read_json_file(device: &DeviceCapabilities, path: &str) -> Result<Value, String> {
+    let text = read_file(device, path)?;
+    serde_json::from_str(&text).map_err(|error| error.to_string())
+}
+
+fn json_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
 fn shell(device: &DeviceCapabilities, command: &str) -> Result<Value, String> {
     device.execute(
         "shell_exec",
@@ -156,7 +373,9 @@ fn shell(device: &DeviceCapabilities, command: &str) -> Result<Value, String> {
 
 fn command_mutates(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    [">", "rm ", "del ", "rmdir", "move ", "mv ", "format", "mkfs", "truncate", "rd "]
-        .iter()
-        .any(|token| lower.contains(token))
+    [
+        ">", "rm ", "del ", "rmdir", "move ", "mv ", "format", "mkfs", "truncate", "rd ",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
 }

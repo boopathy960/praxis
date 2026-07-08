@@ -71,10 +71,12 @@ async fn spawn_swarm(
         .await
         .map_err(|error| AppError::Internal(format!("swarm spawn task failed: {error}")))??;
     let sandbox = state.sandbox.guard(sandbox_action, true)?;
-    Ok(HttpResponse::Accepted().json(ApiResponse::ok(serde_json::json!({
-        "swarm": receipt,
-        "sandbox": sandbox,
-    }))))
+    Ok(
+        HttpResponse::Accepted().json(ApiResponse::ok(serde_json::json!({
+            "swarm": receipt,
+            "sandbox": sandbox,
+        }))),
+    )
 }
 
 async fn swarm_status(
@@ -120,7 +122,9 @@ async fn fabricate_agent(
     body: web::Json<FabricateAgentRequest>,
 ) -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Created().json(ApiResponse::ok(
-        state.agent_runtime.fabricate_for_objective(body.into_inner())?,
+        state
+            .agent_runtime
+            .fabricate_for_objective(body.into_inner())?,
     )))
 }
 
@@ -182,11 +186,12 @@ async fn create_execution(
     // async worker pool.
     let runtime = state.agent_runtime.clone();
     let exec_agent_id = agent_id.clone();
-    let receipt = web::block(move || {
-        runtime.create_execution(&exec_agent_id, OWNER_PRINCIPAL, request)
-    })
-    .await
-    .map_err(|error| AppError::Internal(format!("agent execution task failed: {error}")))??;
+    let receipt =
+        web::block(move || runtime.create_execution(&exec_agent_id, OWNER_PRINCIPAL, request))
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("agent execution task failed: {error}"))
+            })??;
     let sandbox = state.sandbox.guard(sandbox_action, true)?;
     let receipt = state
         .agent_runtime

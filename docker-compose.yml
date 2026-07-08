@@ -1,0 +1,38 @@
+
+services:
+  astra-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - ASTRA_HOST=0.0.0.0
+      - ASTRA_PORT=8080
+      - ASTRA_DATA_DIR=/app/data
+      # Uncomment and set these to use an LLM for reasoning.
+      # Set ASTRA_ASC2_REMOTE_API_KEY in your shell or a local .env file that
+      # docker-compose reads via `env_file:` — never commit a real key here.
+      - ASTRA_ASC2_REMOTE_ENDPOINT=https://integrate.api.nvidia.com/v1
+      - ASTRA_ASC2_REMOTE_API_KEY=${ASTRA_ASC2_REMOTE_API_KEY:-}
+      - ASTRA_ASC2_REMOTE_MODEL=nvidia/nemotron-3-ultra-550b-a55b
+      
+      # Optional SearXNG integration
+      - ASTRA_SEARXNG_URL=https://searx.be
+    volumes:
+      - astra_data:/app/data
+      - c:\:/host_c_drive:ro
+
+  # Uncomment if you want to self-host SearXNG alongside Astra
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - BASE_URL=http://localhost:8888/
+      - INSTANCE_NAME=astra-search
+
+volumes:
+  astra_data:

@@ -148,7 +148,9 @@ impl AgenticLoop {
     pub async fn run(&self, request: LoopRequest) -> Result<LoopResult, AppError> {
         let objective = request.objective.trim().to_string();
         if objective.is_empty() {
-            return Err(AppError::Validation("agentic loop objective is empty".into()));
+            return Err(AppError::Validation(
+                "agentic loop objective is empty".into(),
+            ));
         }
         let max = if request.max_iterations == 0 {
             DEFAULT_MAX_ITERATIONS
@@ -237,8 +239,15 @@ impl AgenticLoop {
                 }
             };
 
-            if action.done {
-                final_answer = action.final_answer.unwrap_or_default();
+            // Conclude when the model signals done, OR when it stops requesting a
+            // tool — an empty tool name means it is answering rather than acting,
+            // and many models reply with their answer instead of the exact `done`
+            // envelope. Treating that as a conclusion makes the loop model-agnostic.
+            if action.done || action.tool.trim().is_empty() {
+                final_answer = action
+                    .final_answer
+                    .filter(|answer| !answer.trim().is_empty())
+                    .unwrap_or_else(|| action.reasoning.clone());
                 status = "completed";
                 break;
             }
@@ -265,7 +274,10 @@ impl AgenticLoop {
             // else goes straight to the supervised device layer.
             let tool = action.tool.clone();
             let input = action.input.clone();
-            let via_forge = self.forge.as_ref().is_some_and(|forge| forge.has_active(&tool));
+            let via_forge = self
+                .forge
+                .as_ref()
+                .is_some_and(|forge| forge.has_active(&tool));
             let dispatch = if via_forge {
                 let forge = self.forge.clone().expect("forge present for active tool");
                 actix_web::web::block(move || forge.execute(&tool, &input))
@@ -289,7 +301,10 @@ impl AgenticLoop {
 
             // ── Observe + verify the contract ──
             let (vstatus, vdetail) = if !ran_ok {
-                ("failed".to_string(), format!("tool returned an error: {output_summary}"))
+                (
+                    "failed".to_string(),
+                    format!("tool returned an error: {output_summary}"),
+                )
             } else if let Some(postcondition) = &action.postcondition {
                 let outcome = crate::verification::run(postcondition, &self.device, Some(&output));
                 (
@@ -320,6 +335,33 @@ impl AgenticLoop {
                 postcondition: action.postcondition,
                 verification: vdetail,
             });
+        }
+
+        // Convergence safety net: if the loop ran out of steps without the model
+        // ever emitting a final answer, do ONE synthesis pass over what was
+        // observed, so the caller gets the data it gathered instead of an empty
+        // string. The status stays "max_iterations" — this is a best-effort
+        // summary of real observations, not a cleanly-completed, verified run.
+        if status == "max_iterations"
+            && final_answer.trim().is_empty()
+            && !history.trim().is_empty()
+        {
+            let synthesis = self
+                .reasoner
+                .complete(
+                    "You are concluding a task that ran out of steps. Using ONLY the observations \
+                     below, give the most direct final answer to the goal. If the answer is a value \
+                     (a price, a path, a number), state it plainly. If the observations do not \
+                     contain the answer, say so honestly. Be concise."
+                        .into(),
+                    format!("GOAL: {objective}\n\nObservations so far:\n{history}\n\nFinal answer:"),
+                )
+                .await
+                .unwrap_or_default();
+            let synthesis = synthesis.trim();
+            if !synthesis.is_empty() {
+                final_answer = synthesis.to_string();
+            }
         }
 
         let all_verified = !steps.is_empty()
@@ -371,7 +413,6 @@ impl AgenticLoop {
                 .into(),
         })
     }
-
 }
 
 fn default_readonly_tools() -> Vec<String> {
@@ -383,17 +424,14 @@ fn default_readonly_tools() -> Vec<String> {
         "fs_read",
         "web_search",
         "deep_crawl",
+        "http_get",
     ]
     .iter()
     .map(|t| (*t).to_string())
     .collect()
 }
 
-fn tool_allowed(
-    tool: &str,
-    allow: &[String],
-    forge: Option<&crate::forge::ForgeService>,
-) -> bool {
+fn tool_allowed(tool: &str, allow: &[String], forge: Option<&crate::forge::ForgeService>) -> bool {
     // A forged tool is allowed only when it is `Active` AND every governed
     // primitive it composes is itself within this run's allowlist — so a forged
     // capability can never exceed the privilege the run was granted (a read-only
@@ -410,9 +448,9 @@ fn tool_allowed(
 
 fn primitive_in_allow(tool: &str, allow: &[String]) -> bool {
     let canonical = crate::device_agent::canonical_device_tool(tool);
-    allow
-        .iter()
-        .any(|allowed| allowed == tool || crate::device_agent::canonical_device_tool(allowed) == canonical)
+    allow.iter().any(|allowed| {
+        allowed == tool || crate::device_agent::canonical_device_tool(allowed) == canonical
+    })
 }
 
 /// Fence-tolerant extraction of the JSON action object from a model reply.
@@ -463,7 +501,11 @@ fn build_system_prompt(allow: &[String], forged: &[(String, String)]) -> String 
          {{\"type\":\"path_absent\",\"path\":\"...\"}}\n\
          {{\"type\":\"output_contains\",\"substring\":\"...\"}}\n\
          If a previous step shows status=failed, do NOT repeat it blindly — diagnose and try a \
-         different approach, or finish with done=true explaining the blocker."
+         different approach, or finish with done=true explaining the blocker.\n\
+         CONCLUDE EARLY: the MOMENT an observation already contains the answer to the goal, STOP \
+         calling tools and reply with {{\"done\":true,\"final_answer\":\"<the answer, stated plainly>\"}}. \
+         Do not keep gathering once you can answer. To fetch live web data (a price, an API value), \
+         prefer the http_get tool with a concrete URL over shell commands."
     );
     prompt.push_str(&forged_block);
     prompt
@@ -489,11 +531,23 @@ fn tool_hint(tool: &str) -> &'static str {
         "disk_usage" => "report disk usage (input {})",
         "fs_list" => "list a directory (input {\"path\":\"...\"})",
         "fs_read" => "read a file (input {\"path\":\"...\"})",
-        "fs_write" => "write a file (input {\"path\":\"...\",\"content\":\"...\"}) — needs a postcondition",
-        "open_path" => "open a file/url in the user's apps (input {\"path\":\"...\"}) — needs a postcondition",
-        "shell_exec" => "run a host shell command (input {\"command\":\"...\"}) — mutating ones need a postcondition",
-        "deep_crawl" => "search+crawl the web for structured data (input {\"query\":\"...\"} or {\"urls\":[...]})",
+        "fs_write" => {
+            "write a file (input {\"path\":\"...\",\"content\":\"...\"}) — needs a postcondition"
+        }
+        "open_path" => {
+            "open a file/url in the user's apps (input {\"path\":\"...\"}) — needs a postcondition"
+        }
+        "shell_exec" => {
+            "run a host shell command (input {\"command\":\"...\"}) — mutating ones need a postcondition"
+        }
+        "deep_crawl" => {
+            "search+crawl the web for structured data (input {\"query\":\"...\"} or {\"urls\":[...]})"
+        }
         "web_search" => "discover result URLs for a query (input {\"query\":\"...\"})",
+        "http_get" => {
+            "fetch a URL's body — a JSON API response or web page (input {\"url\":\"https://...\"}); \
+             read-only, and free of the shell quoting that breaks curl — PREFER this for live web data"
+        }
         _ => "tool",
     }
 }
@@ -530,11 +584,10 @@ mod tests {
             Box::pin(async { Err(AppError::Internal("not used".into())) })
         }
         fn complete(&self, _system: String, _user: String) -> BoxFuture<Result<String, AppError>> {
-            let next = self
-                .replies
-                .lock()
-                .pop_front()
-                .unwrap_or_else(|| r#"{"done":true,"final_answer":"out of script"}"#.to_string());
+            let next =
+                self.replies.lock().pop_front().unwrap_or_else(|| {
+                    r#"{"done":true,"final_answer":"out of script"}"#.to_string()
+                });
             Box::pin(async move { Ok(next) })
         }
     }
@@ -558,7 +611,9 @@ mod tests {
             r#"{{"reasoning":"write it","tool":"fs_write","input":{{"path":"{0}","content":"hello loop"}},"postcondition":{{"type":"file_contains","path":"{0}","substring":"hello loop"}},"done":false}}"#,
             esc(&file)
         );
-        let finish = r#"{"done":true,"final_answer":"note created and verified","reasoning":"done"}"#.to_string();
+        let finish =
+            r#"{"done":true,"final_answer":"note created and verified","reasoning":"done"}"#
+                .to_string();
         let lp = AgenticLoop::new(ScriptedExecutor::new(vec![write, finish]), device);
         let result = lp
             .run(LoopRequest {
@@ -573,7 +628,11 @@ mod tests {
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.steps[0].status, "verified");
         assert!(result.all_verified);
-        assert!(std::fs::read_to_string(&file).unwrap().contains("hello loop"));
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("hello loop")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -587,7 +646,9 @@ mod tests {
             r#"{{"reasoning":"write","tool":"fs_write","input":{{"path":"{0}","content":"goodbye"}},"postcondition":{{"type":"file_contains","path":"{0}","substring":"hello"}},"done":false}}"#,
             esc(&file)
         );
-        let finish = r#"{"done":true,"final_answer":"could not satisfy the goal","reasoning":"blocked"}"#.to_string();
+        let finish =
+            r#"{"done":true,"final_answer":"could not satisfy the goal","reasoning":"blocked"}"#
+                .to_string();
         let lp = AgenticLoop::new(ScriptedExecutor::new(vec![bad_write, finish]), device);
         let result = lp
             .run(LoopRequest {
@@ -598,15 +659,21 @@ mod tests {
             .await
             .expect("loop");
         assert_eq!(result.steps[0].status, "failed");
-        assert!(!result.all_verified, "a failed contract must not report verified");
+        assert!(
+            !result.all_verified,
+            "a failed contract must not report verified"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[actix_web::test]
     async fn loop_denies_tool_outside_allowlist() {
         let device = Arc::new(DeviceCapabilities::new(DevicePolicy::permissive()));
-        let try_shell = r#"{"reasoning":"run","tool":"shell_exec","input":{"command":"echo hi"},"done":false}"#.to_string();
-        let finish = r#"{"done":true,"final_answer":"stopped","reasoning":"not allowed"}"#.to_string();
+        let try_shell =
+            r#"{"reasoning":"run","tool":"shell_exec","input":{"command":"echo hi"},"done":false}"#
+                .to_string();
+        let finish =
+            r#"{"done":true,"final_answer":"stopped","reasoning":"not allowed"}"#.to_string();
         let lp = AgenticLoop::new(ScriptedExecutor::new(vec![try_shell, finish]), device);
         let result = lp
             .run(LoopRequest {
@@ -629,7 +696,8 @@ mod tests {
             r#"{{"reasoning":"read it","tool":"fs_read","input":{{"path":"{}"}},"postcondition":null,"done":false}}"#,
             esc(&file)
         );
-        let finish = r#"{"done":true,"final_answer":"the answer is 42","reasoning":"found it"}"#.to_string();
+        let finish =
+            r#"{"done":true,"final_answer":"the answer is 42","reasoning":"found it"}"#.to_string();
         let lp = AgenticLoop::new(ScriptedExecutor::new(vec![read, finish]), device);
         let result = lp
             .run(LoopRequest {
@@ -697,8 +765,26 @@ mod tests {
                 depends_on: vec![],
             })
             .unwrap();
-        economy.attack(&claim.claim_id, AttackRequest { attacker: "b".into(), note: String::new(), counter: None }).unwrap();
-        let minted = economy.attack(&claim.claim_id, AttackRequest { attacker: "c".into(), note: String::new(), counter: None }).unwrap();
+        economy
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "b".into(),
+                    note: String::new(),
+                    counter: None,
+                },
+            )
+            .unwrap();
+        let minted = economy
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "c".into(),
+                    note: String::new(),
+                    counter: None,
+                },
+            )
+            .unwrap();
         assert_eq!(format!("{:?}", minted.status), "Minted");
 
         // A loop with the same objective recalls it instead of doing any work.
@@ -737,8 +823,26 @@ mod tests {
                 depends_on: vec![],
             })
             .unwrap();
-        economy.attack(&claim.claim_id, AttackRequest { attacker: "b".into(), note: String::new(), counter: None }).unwrap();
-        economy.attack(&claim.claim_id, AttackRequest { attacker: "c".into(), note: String::new(), counter: None }).unwrap();
+        economy
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "b".into(),
+                    note: String::new(),
+                    counter: None,
+                },
+            )
+            .unwrap();
+        economy
+            .attack(
+                &claim.claim_id,
+                AttackRequest {
+                    attacker: "c".into(),
+                    note: String::new(),
+                    counter: None,
+                },
+            )
+            .unwrap();
 
         // ...and ask for it phrased differently. Exact match would miss; the
         // lexical-cosine recall hits because the content words overlap.

@@ -27,3 +27,6 @@ Thumbs.db
 db.json
 desktop.ini
 $RECYCLE.BIN/
+
+# Praxis OS build output: bootable disk images + QEMU debug serial captures
+os/dist/

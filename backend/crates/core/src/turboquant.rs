@@ -398,13 +398,9 @@ impl TurboQuant {
     /// Dot of the i-th Gaussian QJL row with `vector`, with the row streamed
     /// from the seeded generator instead of being stored.
     fn qjl_row_dot(&self, row: usize, vector: &[f64]) -> f64 {
-        let mut rng = SplitMix64::new(
-            self.seed ^ (row as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        );
-        vector
-            .iter()
-            .map(|value| value * rng.next_gaussian())
-            .sum()
+        let mut rng =
+            SplitMix64::new(self.seed ^ (row as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        vector.iter().map(|value| value * rng.next_gaussian()).sum()
     }
 }
 

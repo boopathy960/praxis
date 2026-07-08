@@ -49,7 +49,7 @@ use crate::asc2::ReasoningExecutor;
 use crate::common::{AppError, new_id, now_ms};
 use crate::device_agent::{DeviceCapabilities, canonical_device_tool, is_device_tool};
 use crate::proof_economy::{AttackRequest, ClaimKind, ClaimStatus, ProofEconomy, ProposeRequest};
-use crate::verification::Check;
+use crate::verification::{Check, ProofContract};
 
 /// Hard ceiling on recipe length — bounds blast radius and keeps a forged tool
 /// legible. A recipe is a *composition*, not a program.
@@ -79,9 +79,13 @@ pub enum RecipeStep {
         input: Value,
     },
     /// Pull a JSON pointer out of the running value (e.g. `/stdout`).
-    Extract { pointer: String },
+    Extract {
+        pointer: String,
+    },
     /// Render a template string against the step context.
-    Template { format: String },
+    Template {
+        format: String,
+    },
     /// Lowercase / uppercase the running value's text.
     Lower,
     Upper,
@@ -135,6 +139,11 @@ pub struct ForgedTool {
     pub canary_input: Value,
     /// The context-free, re-runnable contract the tool must satisfy.
     pub contract: Check,
+    /// Rich contract metadata: multi-check proof, optional eval suite, rollback
+    /// probes, and continuous-watch policy. `contract` remains the primary check
+    /// for older callers.
+    #[serde(default)]
+    pub proof_contract: ProofContract,
     /// The proof-economy claim whose survival gates this tool, if one was minted.
     #[serde(default)]
     pub claim_id: Option<String>,
@@ -183,6 +192,8 @@ struct RecipeDraft {
     #[serde(default)]
     canary_input: Value,
     contract: Check,
+    #[serde(default)]
+    proof_contract: Option<ProofContract>,
 }
 
 /// The Forge. Holds the durable registry of forged tools, the LLM that authors
@@ -196,6 +207,10 @@ pub struct ForgeService {
     device: Arc<DeviceCapabilities>,
     economy: ProofEconomy,
     reasoner: Arc<dyn ReasoningExecutor>,
+    /// The root-cause reasoner consulted before re-authoring, so a heal repairs
+    /// the *cause* of a regression, not just its symptom. Optional: absent it,
+    /// heal falls back to the plain repair prompt.
+    crucible: Option<crate::crucible::Crucible>,
 }
 
 impl ForgeService {
@@ -222,6 +237,7 @@ impl ForgeService {
             device,
             economy,
             reasoner,
+            crucible: None,
         })
     }
 
@@ -240,7 +256,17 @@ impl ForgeService {
             device,
             economy,
             reasoner,
+            crucible: None,
         })
+    }
+
+    /// Attach the [Crucible](crate::crucible) so a heal first diagnoses the root
+    /// cause of a regression — "why did this break?" — and re-authors against the
+    /// cause, not the symptom.
+    #[must_use]
+    pub fn with_crucible(mut self, crucible: crate::crucible::Crucible) -> Self {
+        self.crucible = Some(crucible);
+        self
     }
 
     // ── Forge: build a new, proof-gated capability ──────────────────────────
@@ -285,7 +311,14 @@ impl ForgeService {
         let tool_id = new_id("forged");
         // The contract is templated against the canary input, then frozen to a
         // concrete, independently re-runnable Check.
-        let contract = resolve_check(&draft.contract, &draft.canary_input)?;
+        let proof_contract = resolve_contract(
+            draft
+                .proof_contract
+                .clone()
+                .unwrap_or_else(|| ProofContract::single(draft.contract.clone())),
+            &draft.canary_input,
+        )?;
+        let contract = proof_contract.primary_check();
 
         let mut tool = ForgedTool {
             tool_id: tool_id.clone(),
@@ -298,6 +331,7 @@ impl ForgeService {
             recipe: draft.recipe.clone(),
             canary_input: draft.canary_input.clone(),
             contract: contract.clone(),
+            proof_contract: proof_contract.clone(),
             claim_id: None,
             status: ToolStatus::Probation,
             health: ToolHealth::default(),
@@ -418,17 +452,39 @@ impl ForgeService {
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("forged tool {name}")))?;
 
-        let diagnosis = format!(
-            "REPAIR MODE. The forged tool '{}' is regressing: failure rate {:.0}% over {} call(s); \
-             last error: {}. Its contract is: {}. Author a corrected recipe that makes this same \
-             contract hold again, composing only the supervised primitives.",
+        let symptom = format!(
+            "The forged tool '{}' is regressing: failure rate {:.0}% over {} call(s); last error: {}.",
             current.name,
             current.health.failure_rate() * 100.0,
             current.health.calls,
             current.health.last_error.as_deref().unwrap_or("(none)"),
+        );
+        // Diagnose the root cause first, so the repair targets the cause — not the
+        // symptom. The Crucible runs read-only checks to confirm *why* it broke;
+        // its finding is folded into the repair prompt. Absent a Crucible (or if
+        // diagnosis is inconclusive), heal falls back to the plain repair prompt.
+        let root_cause = match self.crucible.as_ref() {
+            Some(crucible) => crucible
+                .root_cause_brief(
+                    &symptom,
+                    &format!(
+                        "contract: {}",
+                        serde_json::to_string(&current.contract).unwrap_or_default()
+                    ),
+                )
+                .await
+                .map(|brief| format!(" Diagnosis — {brief}. Fix the cause, not the symptom."))
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let diagnosis = format!(
+            "REPAIR MODE. {symptom}{root_cause} Its contract is: {}. Author a corrected recipe \
+             that makes this same contract hold again, composing only the supervised primitives.",
             serde_json::to_string(&current.contract).unwrap_or_default(),
         );
-        let draft = self.author_recipe(&current.description, Some(&diagnosis)).await?;
+        let draft = self
+            .author_recipe(&current.description, Some(&diagnosis))
+            .await?;
 
         let forge = self.clone();
         let name = name.to_string();
@@ -455,7 +511,9 @@ impl ForgeService {
                     }
                     outcomes.push(outcome);
                 }
-                Err(error) => tracing::warn!(tool = %name, %error, "auto-heal of forged tool errored"),
+                Err(error) => {
+                    tracing::warn!(tool = %name, %error, "auto-heal of forged tool errored")
+                }
             }
         }
         outcomes
@@ -741,9 +799,12 @@ fn load_cache(connection: &Connection) -> Result<HashMap<String, ForgedTool>, Ap
 fn resolve_templates(value: &Value, ctx: &Value) -> Value {
     match value {
         Value::String(text) => resolve_string(text, ctx),
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|item| resolve_templates(item, ctx)).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| resolve_templates(item, ctx))
+                .collect(),
+        ),
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, val)| (key.clone(), resolve_templates(val, ctx)))
@@ -821,6 +882,23 @@ fn resolve_check(check: &Check, canary_input: &Value) -> Result<Check, AppError>
     })
 }
 
+fn resolve_contract(
+    mut contract: ProofContract,
+    canary_input: &Value,
+) -> Result<ProofContract, AppError> {
+    contract.checks = contract
+        .checks
+        .iter()
+        .map(|check| resolve_check(check, canary_input))
+        .collect::<Result<Vec<_>, _>>()?;
+    contract.rollback = contract
+        .rollback
+        .iter()
+        .map(|check| resolve_check(check, canary_input))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(contract)
+}
+
 fn json_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -881,7 +959,8 @@ fn validate_draft(draft: &RecipeDraft) -> Result<(), AppError> {
     // action output is not independently re-runnable, so it cannot mint.
     if matches!(draft.contract, Check::OutputContains { .. }) {
         return Err(AppError::Validation(
-            "forged tool contracts must be context-free (output_contains is not re-runnable)".into(),
+            "forged tool contracts must be context-free (output_contains is not re-runnable)"
+                .into(),
         ));
     }
     Ok(())
@@ -1035,14 +1114,20 @@ mod tests {
             .expect("forge");
 
         // The proof minted, so the tool is Active and callable.
-        assert!(outcome.minted, "contract holds -> should mint: {}", outcome.detail);
+        assert!(
+            outcome.minted,
+            "contract holds -> should mint: {}",
+            outcome.detail
+        );
         assert_eq!(outcome.tool.status, ToolStatus::Active);
         assert!(forge.has_active("save_note"));
         // Its claim is in the ledger and re-verifies cheaply.
         let claim_id = outcome.tool.claim_id.clone().unwrap();
         assert!(forge.economy.verify(&claim_id).unwrap().pass);
         // And the running system can now execute a tool it authored itself.
-        let ran = forge.execute("save_note", &json!({"path": esc(&file)})).unwrap();
+        let ran = forge
+            .execute("save_note", &json!({"path": esc(&file)}))
+            .unwrap();
         assert_eq!(ran["forged"], json!(true));
         assert!(std::fs::read_to_string(&file).unwrap().contains("ok"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1073,7 +1158,11 @@ mod tests {
         assert_eq!(outcome.tool.status, ToolStatus::Probation);
         // A non-minted tool is registered but NOT callable.
         assert!(!forge.has_active("bad_note"));
-        assert!(forge.execute("bad_note", &json!({"path": esc(&file)})).is_err());
+        assert!(
+            forge
+                .execute("bad_note", &json!({"path": esc(&file)}))
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1115,7 +1204,13 @@ mod tests {
         // world has been repaired.
         let current = forge.get("fetch_data").unwrap();
         assert_eq!(current.version, 2);
-        assert!(forge.economy.verify(current.claim_id.as_ref().unwrap()).unwrap().pass);
+        assert!(
+            forge
+                .economy
+                .verify(current.claim_id.as_ref().unwrap())
+                .unwrap()
+                .pass
+        );
         assert!(std::fs::read_to_string(&good).unwrap().contains("live"));
         assert!(forge.heal_targets().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1161,7 +1256,10 @@ mod tests {
                 objective: "do something".into(),
             })
             .await;
-        assert!(result.is_err(), "recipes may only compose governed primitives");
+        assert!(
+            result.is_err(),
+            "recipes may only compose governed primitives"
+        );
     }
 
     #[actix_web::test]
