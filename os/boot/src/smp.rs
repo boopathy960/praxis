@@ -6,7 +6,9 @@
 //! 16-bit real mode at a **trampoline** page, walks itself up through protected
 //! mode into 64-bit long mode using the *same* page tables the boot core uses
 //! (so the kernel is already mapped), switches to a private stack, and jumps
-//! into [`ap_entry`], where it records itself as online.
+//! into [`ap_entry`], where it records itself as online and then spins
+//! incrementing its own tick counter forever — the live, ongoing proof that
+//! it is a genuinely independent instruction stream, not a one-time check-in.
 //!
 //! The trampoline is position-fixed at physical `0x8000` (SIPI vector `0x08`):
 //! every absolute address inside it is written as `label − start + 0x8000`, so
@@ -71,8 +73,32 @@ unsafe fn map_identity(
 const TRAMPOLINE_PHYS: u64 = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = 0x08;
 
-/// How many cores have finished bring-up and reported in.
+/// How many cores have finished bring-up and reported in. Doubles as each
+/// AP's claimed index (see [`ap_entry`]): bring-up starts cores strictly one
+/// at a time and waits for a check-in before starting the next, so the
+/// pre-increment value this fetch_add returns is stable per AP.
 static AP_ONLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-AP tick counters: **not** a one-time check-in flag but a work counter
+/// each AP increments forever after coming online. This is the difference
+/// between "a core answered once" and "a core is genuinely running its own
+/// independent instruction stream" — reading this twice, moments apart, and
+/// seeing every online core's count advance is the live proof of real SMP.
+static AP_TICKS: [AtomicU64; MAX_APS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// A snapshot of every AP's tick counter, for the `cpus` shell command.
+#[must_use]
+pub fn ap_tick_snapshot() -> [u64; MAX_APS] {
+    core::array::from_fn(|i| AP_TICKS[i].load(Ordering::Relaxed))
+}
 
 /// Per-AP stacks (bring-up is serialized, so one reusable region per core, up
 /// to a small fixed fleet). 16 KiB each.
@@ -175,15 +201,25 @@ extern "C" {
     static ap_tramp_entry: u8;
 }
 
-/// The 64-bit entry every AP reaches. Increment the online counter and park —
-/// the AP has proven it can execute kernel code; a full SMP scheduler would
-/// take over here. Uses only an atomic and its own stack, so it is safe
-/// against the boot core with no locks.
+/// The 64-bit entry every AP reaches. `fetch_add` both reports this core
+/// online (bring-up polls the same counter) *and* hands back a stable index
+/// (0, 1, 2, …) this AP claims for life — safe because bring-up starts cores
+/// strictly one at a time and waits for a check-in before sending the next
+/// SIPI. From there the AP never parks: it spins incrementing its own tick
+/// counter forever, so `cpus` can read [`AP_TICKS`] twice, moments apart, and
+/// show every online core's count independently advancing — a second
+/// instruction stream genuinely executing, not just a one-time check-in.
+/// Uses only atomics and its own stack, so it is safe against the boot core
+/// with no locks. Interrupts stay off (no IDT is loaded for the AP); a full
+/// SMP scheduler would install one and take over here.
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry() -> ! {
-    AP_ONLINE.fetch_add(1, Ordering::SeqCst);
+    let idx = AP_ONLINE.fetch_add(1, Ordering::SeqCst) as usize;
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
+        if idx < MAX_APS {
+            AP_TICKS[idx].fetch_add(1, Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
     }
 }
 

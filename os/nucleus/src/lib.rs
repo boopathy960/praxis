@@ -135,6 +135,12 @@ pub struct CpuTopology {
     pub cores_online: usize,
     /// Physical address of the Local APIC, when known.
     pub local_apic: u64,
+    /// Each online AP's live tick counter (index 0 = first AP started, …),
+    /// refreshed by the platform layer just before `cpus` runs. Not a
+    /// one-time check-in: every online core increments its own slot forever,
+    /// so reading this twice and seeing the numbers advance is the live proof
+    /// that core is genuinely, independently executing.
+    pub ap_ticks: [u64; 8],
 }
 
 impl Nucleus {
@@ -164,6 +170,7 @@ impl Nucleus {
                 cores_total: 1,
                 cores_online: 0,
                 local_apic: 0,
+                ap_ticks: [0; 8],
             },
         }
     }

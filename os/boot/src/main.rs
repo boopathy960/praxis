@@ -136,6 +136,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     cores_total: info.enabled_count(),
                     cores_online: 0,
                     local_apic: info.local_apic_addr,
+                    ap_ticks: [0; 8],
                 };
                 let aps = info.application_processor_ids();
                 if aps.is_empty() {
@@ -364,6 +365,16 @@ fn feed(
     match byte {
         b'\r' | b'\n' => {
             let _ = writeln!(console);
+            // Refresh the live per-AP tick counters just before dispatch, so
+            // `cpus` always reports this instant's snapshot rather than
+            // whatever was true at boot.
+            if line.trim() == "cpus" {
+                let ticks = smp::ap_tick_snapshot();
+                let mut padded = [0u64; 8];
+                let n = ticks.len().min(8);
+                padded[..n].copy_from_slice(&ticks[..n]);
+                nucleus.cpu_topology.ap_ticks = padded;
+            }
             nucleus.exec_line(line, console);
             line.clear();
             let _ = write!(console, "praxsh> ");

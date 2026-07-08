@@ -1770,6 +1770,19 @@ fn cpus_cmd(nucleus: &Nucleus, out: &mut dyn Write) -> core::fmt::Result {
     }
     if t.cores_online == 0 && t.cores_total <= 1 {
         writeln!(out, "(uniprocessor, or hosted runner — no SMP bring-up)")?;
+    } else if t.cores_online > 0 {
+        // Every online AP has been spinning its own tick counter since it
+        // came up — never a one-time check-in. Print them, and note that
+        // running `cpus` again with time in between will show every count
+        // higher than this: the live proof each is an independent stream.
+        write!(
+            out,
+            "application core ticks (run `cpus` again to see them advance):"
+        )?;
+        for (i, &t) in t.ap_ticks.iter().take(t.cores_online).enumerate() {
+            write!(out, " ap{i}={t}")?;
+        }
+        writeln!(out)?;
     }
     Ok(())
 }

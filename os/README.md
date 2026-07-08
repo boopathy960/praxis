@@ -5,7 +5,10 @@ A freestanding Rust kernel (see `../PRAXIS.md` for the full thesis). Three crate
 **What runs, verified live on (emulated) hardware:** boots on bare-metal
 x86_64; discovers every CPU core via **ACPI/MADT** and **starts the application
 cores for real** (INIT-SIPI-SIPI → a from-scratch 16→32→64-bit trampoline →
-each core reports in: `3/3 application cores online`); drops to **ring 3 and
+each core reports in: `3/3 application cores online`) — and each stays
+genuinely, independently running afterward: `cpus` reads live per-core tick
+counters that visibly advance between calls, proof of real ongoing parallel
+execution, not a one-time check-in; drops to **ring 3 and
 runs a real ELF program loaded from its own VFS**, servicing `syscall` traps;
 keeps files **durable across power cycles with a crash-safe journal**; talks to
 the real internet over a from-scratch **e1000 + TCP/IP stack with
@@ -196,6 +199,39 @@ returned `Preempted { from, to }` is where `switch::switch_context` fires.
 
 praxsh commands: `top` (proof-weighted scheduler view) · `quantum [n]` (advance
 the RT scheduler live).
+
+## SMP — starting every core for real (`nucleus/src/{acpi,lapic}.rs`, `boot/src/smp.rs`)
+
+Discovering cores (ACPI/MADT) is only half of SMP; the other half is making a
+*second* core execute your code. Praxis does both:
+
+- **`nucleus/src/acpi.rs`** walks RSDP → RSDT/XSDT → MADT and enumerates every
+  Local APIC entry — one per logical CPU, with its APIC id and enabled flag —
+  behind a `PhysMem` trait, so the walk is unit-tested on the host against a
+  synthetic firmware image.
+- **`nucleus/src/lapic.rs`** encodes the INIT and STARTUP inter-processor
+  interrupts (the Interrupt Command Register fields, per the SDM) behind a
+  `LapicMmio` trait, also host-tested against a recording mock.
+- **`boot/src/smp.rs`** is the bare-metal glue: a **from-scratch AP
+  trampoline** — a page of hand-written `.code16` → `.code32` → `.code64`
+  assembly, position-fixed at physical `0x8000` — that an application core
+  executes after INIT-SIPI-SIPI. It walks itself through protected mode into
+  64-bit long mode on the *same page tables* the boot core built (after the
+  boot core identity-maps the trampoline page so it survives enabling paging),
+  switches to a private stack, and jumps into Rust.
+
+Bring-up is **best-effort and bounded**: each core gets a deadline to check
+in; a core that never answers simply isn't counted, so the boot core can never
+hang on hardware that didn't respond.
+
+Once online, an AP does not just check in once and park — it spins
+incrementing its own tick counter **forever**. `cpus` prints those counters
+live; running it twice and watching every online core's number advance
+(verified live under `-smp 4`: three independent counters climbing by
+millions between two calls, seconds apart) is the actual proof of SMP —
+genuinely, continuously independent execution, not a one-shot handshake.
+
+praxsh command: `cpus` (topology + live per-core tick counters).
 
 ## Operator primitives — command lines no Unix has (`nucleus/src/ops.rs`)
 
